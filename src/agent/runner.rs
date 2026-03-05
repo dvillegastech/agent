@@ -2,41 +2,42 @@ use colored::Colorize;
 use futures::future::join_all;
 
 use crate::config::AgentConfig;
+use crate::cost::CostTracker;
 use crate::error::Result;
-use crate::providers::LlmProvider;
+use crate::export;
+use crate::retry;
+use crate::streaming::StreamingClient;
 use crate::tools::all_tool_definitions;
 use crate::tools::executor::ToolExecutor;
 use crate::types::*;
 
 use super::conversation::Conversation;
 
-/// El agente principal que coordina LLM, herramientas y conversación.
+/// The main agent that coordinates LLM, tools, and conversation.
 pub struct AgentRunner {
-    provider: Box<dyn LlmProvider>,
+    streaming_client: StreamingClient,
     executor: ToolExecutor,
     conversation: Conversation,
     tools: Vec<ToolDefinition>,
     system_prompt: String,
     max_tool_iterations: usize,
+    cost_tracker: CostTracker,
 }
 
 impl AgentRunner {
-    pub fn new(
-        config: &AgentConfig,
-        provider: Box<dyn LlmProvider>,
-        executor: ToolExecutor,
-    ) -> Self {
+    pub fn new(config: &AgentConfig, executor: ToolExecutor) -> Self {
         Self {
-            provider,
+            streaming_client: StreamingClient::new(config),
             executor,
             conversation: Conversation::new(config.max_conversation_turns),
             tools: all_tool_definitions(),
             system_prompt: config.system_prompt.clone(),
             max_tool_iterations: config.max_tool_iterations,
+            cost_tracker: CostTracker::new(&config.model),
         }
     }
 
-    /// Procesa un mensaje del usuario y retorna la respuesta final.
+    /// Process a user message and return the final text response.
     pub async fn process_message(&mut self, user_input: &str) -> Result<String> {
         self.conversation.add_user_message(user_input);
 
@@ -52,31 +53,33 @@ impl AgentRunner {
                 break;
             }
 
-            let response = self
-                .provider
-                .chat(
-                    self.conversation.messages(),
-                    &self.tools,
-                    &self.system_prompt,
-                )
-                .await?;
+            // Use retry with backoff for the streaming call
+            let messages = self.conversation.messages().to_vec();
+            let tools = self.tools.clone();
+            let system = self.system_prompt.clone();
+            let client = &self.streaming_client;
 
+            let response = retry::with_retry("LLM request", || {
+                let msgs = messages.clone();
+                let t = tools.clone();
+                let s = system.clone();
+                async move { client.stream_chat(&msgs, &t, &s).await }
+            })
+            .await?;
+
+            // Track token usage
             if let Some(ref usage) = response.usage {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  [tokens] input: {} | output: {}",
-                        usage.input_tokens, usage.output_tokens
-                    )
-                    .dimmed()
-                );
+                self.cost_tracker
+                    .record(usage.input_tokens, usage.output_tokens);
+                self.cost_tracker
+                    .print_update(usage.input_tokens, usage.output_tokens);
             }
 
-            // Single-pass decomposition: extract text and tool calls together
+            // Decompose response into text and tool calls
             let (text, tool_calls) = response.decompose();
 
             if tool_calls.is_empty() {
-                // Final response with no tools - move content instead of cloning
+                // Final response - no tools needed
                 self.conversation
                     .add_assistant_message(MessageContent::Blocks(response.content));
                 return Ok(if text.is_empty() {
@@ -86,11 +89,7 @@ impl AgentRunner {
                 });
             }
 
-            // Show partial text before executing tools
-            if !text.is_empty() {
-                println!("{}", text);
-            }
-
+            // Show partial text before executing tools (already streamed to stdout)
             // Collect tool call info before moving response.content
             let tool_infos: Vec<_> = tool_calls
                 .iter()
@@ -109,11 +108,11 @@ impl AgentRunner {
                 })
                 .collect();
 
-            // Store assistant response (move, not clone)
+            // Store assistant response
             self.conversation
                 .add_assistant_message(MessageContent::Blocks(response.content));
 
-            // Execute tools concurrently via join_all
+            // Execute tools concurrently
             let executor = &self.executor;
             let tool_futures: Vec<_> = tool_infos
                 .into_iter()
@@ -154,14 +153,31 @@ impl AgentRunner {
         Ok("[Agent stopped after max iterations]".into())
     }
 
-    /// Limpia la conversación.
+    /// Export the conversation to a file.
+    pub fn export_conversation(&self, path: &std::path::Path, format: &str) -> Result<()> {
+        match format {
+            "json" => export::to_json(self.conversation.messages(), path),
+            _ => export::to_markdown(self.conversation.messages(), path),
+        }
+    }
+
+    /// Get cost tracking summary.
+    pub fn cost_summary(&self) -> String {
+        self.cost_tracker.summary()
+    }
+
+    /// Clear conversation history.
     pub fn clear_conversation(&mut self) {
         self.conversation.clear();
     }
 
-    /// Retorna estadísticas de la conversación.
+    /// Get conversation statistics.
     pub fn stats(&self) -> String {
-        format!("Messages: {}", self.conversation.len())
+        format!(
+            "Messages: {} | {}",
+            self.conversation.len(),
+            self.cost_tracker.summary()
+        )
     }
 }
 

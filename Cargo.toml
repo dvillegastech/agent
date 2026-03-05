@@ -1,6 +1,6 @@
 [package]
 name = "rustclaw"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A secure, functional LLM agent CLI written in Rust"
 license = "MIT"
@@ -19,6 +19,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -26,8 +27,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Interactive REPL
 rustyline = "14"
 
-# Terminal colors
+# Terminal colors and markdown rendering
 colored = "2"
+termimad = "0.30"
 
 # Environment variables
 dotenvy = "0.15"
@@ -55,3 +57,6 @@ regex = "1"
 
 # Dirs for config paths
 dirs = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,11 +1,17 @@
 mod agent;
 mod cli;
 mod config;
+mod cost;
 mod error;
+mod export;
+mod markdown;
 mod onboarding;
-mod providers;
+mod retry;
+mod streaming;
 mod tools;
 mod types;
+
+use std::path::PathBuf;
 
 use clap::Parser;
 use colored::Colorize;
@@ -15,9 +21,6 @@ use rustyline::DefaultEditor;
 use crate::agent::runner::AgentRunner;
 use crate::cli::{Cli, Commands};
 use crate::config::{AgentConfig, ProviderKind};
-use crate::providers::anthropic::AnthropicProvider;
-use crate::providers::openai::OpenAIProvider;
-use crate::providers::LlmProvider;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::security::SecurityGuard;
 
@@ -40,13 +43,6 @@ fn print_banner() {
     );
 }
 
-fn build_provider(config: &AgentConfig) -> Box<dyn LlmProvider> {
-    match config.provider {
-        ProviderKind::Anthropic => Box::new(AnthropicProvider::new(config)),
-        ProviderKind::OpenAI => Box::new(OpenAIProvider::new(config)),
-    }
-}
-
 async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
     print_banner();
 
@@ -54,19 +50,29 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
         "{}",
         "  Type your message and press Enter. Commands:".dimmed()
     );
-    println!("{}", "    /clear  - Clear conversation history".dimmed());
-    println!("{}", "    /stats  - Show conversation stats".dimmed());
-    println!("{}", "    /help   - Show this help".dimmed());
+    println!("{}", "    /clear   - Clear conversation history".dimmed());
+    println!("{}", "    /stats   - Show conversation stats & cost".dimmed());
+    println!("{}", "    /cost    - Show cost breakdown".dimmed());
     println!(
         "{}",
-        "    /quit   - Exit (or Ctrl+D / Ctrl+C)".dimmed()
+        "    /export  - Export conversation (md/json)".dimmed()
+    );
+    println!(
+        "{}",
+        "    /multi   - Toggle multi-line input mode".dimmed()
+    );
+    println!("{}", "    /help    - Show this help".dimmed());
+    println!(
+        "{}",
+        "    /quit    - Exit (or Ctrl+D / Ctrl+C)".dimmed()
     );
     println!();
 
     let mut rl = DefaultEditor::new()?;
+    let mut multiline_mode = false;
 
     let history_path = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("rustclaw")
         .join("history.txt");
 
@@ -76,61 +82,108 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
     let _ = rl.load_history(&history_path);
 
     loop {
-        let prompt = format!("{} ", ">>".bright_green());
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let input = line.trim();
-                if input.is_empty() {
+        let input = if multiline_mode {
+            read_multiline(&mut rl)?
+        } else {
+            let prompt = format!("{} ", ">>".bright_green());
+            match rl.readline(&prompt) {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => {
+                    println!("{}", "\nUse /quit to exit.".dimmed());
                     continue;
                 }
-
-                let _ = rl.add_history_entry(input);
-
-                match input {
-                    "/quit" | "/exit" | "/q" => {
-                        println!("{}", "Goodbye!".bright_cyan());
-                        break;
-                    }
-                    "/clear" => {
-                        runner.clear_conversation();
-                        println!("{}", "Conversation cleared.".green());
-                        continue;
-                    }
-                    "/stats" => {
-                        println!("{}", runner.stats().dimmed());
-                        continue;
-                    }
-                    "/help" => {
-                        println!("{}", "Commands:".bright_white());
-                        println!("  {} - Clear conversation", "/clear".cyan());
-                        println!("  {} - Conversation statistics", "/stats".cyan());
-                        println!("  {} - Show this help", "/help".cyan());
-                        println!("  {} - Exit", "/quit".cyan());
-                        continue;
-                    }
-                    _ => {}
+                Err(ReadlineError::Eof) => {
+                    println!("{}", "\nGoodbye!".bright_cyan());
+                    break;
                 }
-
-                println!();
-                match runner.process_message(input).await {
-                    Ok(response) => {
-                        println!("\n{}\n", response);
-                    }
-                    Err(e) => {
-                        eprintln!("\n{} {}\n", "Error:".red().bold(), e);
-                    }
+                Err(e) => {
+                    eprintln!("{} {}", "Readline error:".red(), e);
+                    break;
                 }
             }
-            Err(ReadlineError::Interrupted) => {
-                println!("{}", "\nUse /quit to exit.".dimmed());
-            }
-            Err(ReadlineError::Eof) => {
-                println!("{}", "\nGoodbye!".bright_cyan());
+        };
+
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        let _ = rl.add_history_entry(input);
+
+        // Handle slash commands
+        match input {
+            "/quit" | "/exit" | "/q" => {
+                println!("\n{}", runner.cost_summary().dimmed());
+                println!("{}", "Goodbye!".bright_cyan());
                 break;
+            }
+            "/clear" => {
+                runner.clear_conversation();
+                println!("{}", "Conversation cleared.".green());
+                continue;
+            }
+            "/stats" => {
+                println!("{}", runner.stats().dimmed());
+                continue;
+            }
+            "/cost" => {
+                println!("{}", runner.cost_summary().dimmed());
+                continue;
+            }
+            "/multi" => {
+                multiline_mode = !multiline_mode;
+                if multiline_mode {
+                    println!(
+                        "{}",
+                        "Multi-line mode ON. Enter an empty line to send.".green()
+                    );
+                } else {
+                    println!("{}", "Multi-line mode OFF.".yellow());
+                }
+                continue;
+            }
+            cmd if cmd.starts_with("/export") => {
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                let format = parts.get(1).copied().unwrap_or("md");
+                let filename = parts.get(2).copied().unwrap_or_else(|| {
+                    if format == "json" {
+                        "conversation.json"
+                    } else {
+                        "conversation.md"
+                    }
+                });
+                let path = PathBuf::from(filename);
+                match runner.export_conversation(&path, format) {
+                    Ok(()) => println!("{} {}", "Exported to".green(), path.display()),
+                    Err(e) => eprintln!("{} {}", "Export failed:".red(), e),
+                }
+                continue;
+            }
+            "/help" => {
+                println!("{}", "Commands:".bright_white());
+                println!("  {} - Clear conversation", "/clear".cyan());
+                println!("  {} - Conversation statistics & cost", "/stats".cyan());
+                println!("  {} - Show cost breakdown", "/cost".cyan());
+                println!(
+                    "  {} - Export conversation (format: md|json)",
+                    "/export [format] [file]".cyan()
+                );
+                println!("  {} - Toggle multi-line input mode", "/multi".cyan());
+                println!("  {} - Show this help", "/help".cyan());
+                println!("  {} - Exit", "/quit".cyan());
+                continue;
+            }
+            _ => {}
+        }
+
+        println!();
+        match runner.process_message(input).await {
+            Ok(_response) => {
+                // Response was already streamed to stdout; just add spacing
+                println!();
             }
             Err(e) => {
-                eprintln!("{} {}", "Readline error:".red(), e);
-                break;
+                eprintln!("\n{} {}\n", "Error:".red().bold(), e);
             }
         }
     }
@@ -139,9 +192,36 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read multi-line input. An empty line signals end of input.
+fn read_multiline(rl: &mut DefaultEditor) -> std::result::Result<String, ReadlineError> {
+    let mut lines = Vec::new();
+    let first_prompt = format!("{} ", ">>".bright_green());
+    let cont_prompt = format!("{} ", "..".bright_green());
+
+    loop {
+        let prompt = if lines.is_empty() {
+            &first_prompt
+        } else {
+            &cont_prompt
+        };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                if line.trim().is_empty() && !lines.is_empty() {
+                    break;
+                }
+                lines.push(line);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 async fn run_single(mut runner: AgentRunner, prompt: &str) -> anyhow::Result<()> {
-    let response = runner.process_message(prompt).await?;
-    println!("{response}");
+    let _response = runner.process_message(prompt).await?;
+    // Response was already streamed to stdout
+    println!();
+    eprintln!("\n{}", runner.cost_summary().dimmed());
     Ok(())
 }
 
@@ -184,7 +264,6 @@ async fn load_or_onboard_config() -> anyhow::Result<AgentConfig> {
     match AgentConfig::from_env() {
         Ok(config) => Ok(config),
         Err(_) => {
-            // No valid config found - check if this looks like first run
             if !onboarding::config_exists() {
                 print_banner();
                 println!(
@@ -194,7 +273,6 @@ async fn load_or_onboard_config() -> anyhow::Result<AgentConfig> {
 
                 let result = onboarding::run_onboarding().await?;
 
-                // Reload env from the newly written file
                 let _ = dotenvy::from_path(&result.env_file_path);
 
                 Ok(AgentConfig {
@@ -204,7 +282,6 @@ async fn load_or_onboard_config() -> anyhow::Result<AgentConfig> {
                     ..AgentConfig::default()
                 })
             } else {
-                // Config file exists but is broken
                 eprintln!(
                     "{} {}",
                     "Configuration error:".red().bold(),
@@ -225,14 +302,14 @@ async fn load_or_onboard_config() -> anyhow::Result<AgentConfig> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Handle init subcommand first (doesn't need existing config)
+    // Handle init subcommand first
     if matches!(cli.command, Some(Commands::Init)) {
         print_banner();
         onboarding::run_onboarding().await?;
         return Ok(());
     }
 
-    // Handle config subcommand (can work without API key)
+    // Handle config subcommand
     if matches!(cli.command, Some(Commands::Config)) {
         let config = AgentConfig::from_env().unwrap_or_else(|_| {
             let mut c = AgentConfig::default();
@@ -243,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Load config with auto-onboarding for first-time users
+    // Load config with auto-onboarding
     let mut config = load_or_onboard_config().await?;
 
     // Apply CLI overrides
@@ -264,10 +341,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build components
-    let provider = build_provider(&config);
     let guard = SecurityGuard::new(config.security.clone());
     let executor = ToolExecutor::new(guard);
-    let runner = AgentRunner::new(&config, provider, executor);
+    let runner = AgentRunner::new(&config, executor);
 
     // Run mode
     if let Some(ref prompt) = cli.prompt {
