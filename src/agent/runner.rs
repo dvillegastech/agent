@@ -179,6 +179,11 @@ impl AgentRunner {
             self.cost_tracker.summary()
         )
     }
+
+    /// Get a reference to conversation messages (for session save).
+    pub fn get_messages(&self) -> &[crate::types::Message] {
+        self.conversation.messages()
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

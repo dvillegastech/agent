@@ -50,34 +50,64 @@ pub async fn run_onboarding() -> anyhow::Result<OnboardingResult> {
     // Step 1: Choose provider
     let provider = choose_provider()?;
 
-    // Step 2: Enter API key
-    let api_key = enter_api_key(&provider)?;
+    // Step 2: Enter API key (skip for Ollama)
+    let api_key = if provider == ProviderKind::Ollama {
+        String::new()
+    } else {
+        enter_api_key(&provider)?
+    };
 
-    // Step 3: Validate API key
-    println!(
-        "\n  {} {}",
-        "Validating API key...".dimmed(),
-        "(making a test request)".dimmed()
-    );
-
+    // Step 3: Validate
     let default_model = match provider {
         ProviderKind::Anthropic => "claude-sonnet-4-20250514",
         ProviderKind::OpenAI => "gpt-4o",
+        ProviderKind::Ollama => "qwen3:8b",
     };
 
-    match validate_api_key(&provider, &api_key, default_model).await {
-        Ok(()) => {
-            println!("  {} {}\n", "OK".bright_green().bold(), "API key is valid!".green());
+    if provider == ProviderKind::Ollama {
+        println!(
+            "\n  {} {}",
+            "Checking Ollama server...".dimmed(),
+            "(http://localhost:11434)".dimmed()
+        );
+        match validate_ollama().await {
+            Ok(()) => {
+                println!("  {} {}\n", "OK".bright_green().bold(), "Ollama is running!".green());
+            }
+            Err(e) => {
+                println!(
+                    "  {} {}\n",
+                    "WARNING".yellow().bold(),
+                    format!("Ollama check failed: {e}").yellow()
+                );
+                println!("  {}", "Make sure Ollama is installed and running: https://ollama.ai".dimmed());
+                let proceed = confirm("  Save anyway and continue?")?;
+                if !proceed {
+                    anyhow::bail!("Onboarding cancelled by user.");
+                }
+            }
         }
-        Err(e) => {
-            println!(
-                "  {} {}\n",
-                "WARNING".yellow().bold(),
-                format!("Validation failed: {e}").yellow()
-            );
-            let proceed = confirm("  Save anyway and continue?")?;
-            if !proceed {
-                anyhow::bail!("Onboarding cancelled by user.");
+    } else {
+        println!(
+            "\n  {} {}",
+            "Validating API key...".dimmed(),
+            "(making a test request)".dimmed()
+        );
+
+        match validate_api_key(&provider, &api_key, default_model).await {
+            Ok(()) => {
+                println!("  {} {}\n", "OK".bright_green().bold(), "API key is valid!".green());
+            }
+            Err(e) => {
+                println!(
+                    "  {} {}\n",
+                    "WARNING".yellow().bold(),
+                    format!("Validation failed: {e}").yellow()
+                );
+                let proceed = confirm("  Save anyway and continue?")?;
+                if !proceed {
+                    anyhow::bail!("Onboarding cancelled by user.");
+                }
             }
         }
     }
@@ -114,6 +144,7 @@ fn choose_provider() -> anyhow::Result<ProviderKind> {
     println!();
     println!("    {} Anthropic (Claude)", "[1]".cyan());
     println!("    {} OpenAI (GPT)", "[2]".cyan());
+    println!("    {} Ollama (Local - free, no API key needed)", "[3]".cyan());
     println!();
 
     loop {
@@ -126,8 +157,11 @@ fn choose_provider() -> anyhow::Result<ProviderKind> {
         } else if trimmed == "2" {
             println!("  {} OpenAI\n", "Selected:".dimmed());
             return Ok(ProviderKind::OpenAI);
+        } else if trimmed == "3" {
+            println!("  {} Ollama (Local)\n", "Selected:".dimmed());
+            return Ok(ProviderKind::Ollama);
         } else {
-            println!("  {} Please enter 1 or 2.", "Invalid:".red());
+            println!("  {} Please enter 1, 2, or 3.", "Invalid:".red());
         }
     }
 }
@@ -136,6 +170,7 @@ fn enter_api_key(provider: &ProviderKind) -> anyhow::Result<String> {
     let key_name = match provider {
         ProviderKind::Anthropic => "Anthropic API key (sk-ant-...)",
         ProviderKind::OpenAI => "OpenAI API key (sk-...)",
+        ProviderKind::Ollama => return Ok(String::new()),
     };
 
     println!("  {}", "Step 2: Enter your API key".bright_white().bold());
@@ -144,6 +179,7 @@ fn enter_api_key(provider: &ProviderKind) -> anyhow::Result<String> {
         format!("  Get one at: {}", match provider {
             ProviderKind::Anthropic => "https://console.anthropic.com/settings/keys",
             ProviderKind::OpenAI => "https://platform.openai.com/api-keys",
+            ProviderKind::Ollama => "",
         })
         .dimmed()
     );
@@ -182,6 +218,7 @@ fn enter_api_key(provider: &ProviderKind) -> anyhow::Result<String> {
                     }
                 }
             }
+            ProviderKind::Ollama => {}
         }
 
         return Ok(trimmed);
@@ -245,6 +282,25 @@ async fn validate_api_key(
                 anyhow::bail!("{msg}");
             }
         }
+        ProviderKind::Ollama => validate_ollama().await,
+    }
+}
+
+async fn validate_ollama() -> anyhow::Result<()> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    let resp = client
+        .get("http://localhost:11434/api/tags")
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("Cannot connect to Ollama at localhost:11434"))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Ollama returned status {}", resp.status())
     }
 }
 
@@ -265,6 +321,12 @@ fn choose_model(provider: &ProviderKind, _default: &str) -> anyhow::Result<Strin
             println!("    {} gpt-4-turbo", "[3]".cyan());
             println!("    {} Custom model name", "[4]".cyan());
         }
+        ProviderKind::Ollama => {
+            println!("    {} qwen3:8b (recommended, good for coding)", "[1]".cyan());
+            println!("    {} llama3.3:latest", "[2]".cyan());
+            println!("    {} deepseek-coder-v2:latest", "[3]".cyan());
+            println!("    {} Custom model name (any Ollama model)", "[4]".cyan());
+        }
     }
 
     println!();
@@ -278,15 +340,7 @@ fn choose_model(provider: &ProviderKind, _default: &str) -> anyhow::Result<Strin
                 "" | "1" => "claude-sonnet-4-20250514".to_string(),
                 "2" => "claude-opus-4-20250514".to_string(),
                 "3" => "claude-haiku-3-5-20241022".to_string(),
-                "4" => {
-                    let custom = prompt_input("  Enter model name: ")?;
-                    let m = custom.trim().to_string();
-                    if m.is_empty() {
-                        println!("  {} Model name cannot be empty.", "Error:".red());
-                        continue;
-                    }
-                    m
-                }
+                "4" => prompt_custom_model()?,
                 _ => {
                     println!("  {} Please enter 1-4.", "Invalid:".red());
                     continue;
@@ -296,15 +350,17 @@ fn choose_model(provider: &ProviderKind, _default: &str) -> anyhow::Result<Strin
                 "" | "1" => "gpt-4o".to_string(),
                 "2" => "gpt-4o-mini".to_string(),
                 "3" => "gpt-4-turbo".to_string(),
-                "4" => {
-                    let custom = prompt_input("  Enter model name: ")?;
-                    let m = custom.trim().to_string();
-                    if m.is_empty() {
-                        println!("  {} Model name cannot be empty.", "Error:".red());
-                        continue;
-                    }
-                    m
+                "4" => prompt_custom_model()?,
+                _ => {
+                    println!("  {} Please enter 1-4.", "Invalid:".red());
+                    continue;
                 }
+            },
+            ProviderKind::Ollama => match trimmed {
+                "" | "1" => "qwen3:8b".to_string(),
+                "2" => "llama3.3:latest".to_string(),
+                "3" => "deepseek-coder-v2:latest".to_string(),
+                "4" => prompt_custom_model()?,
                 _ => {
                     println!("  {} Please enter 1-4.", "Invalid:".red());
                     continue;
@@ -315,6 +371,15 @@ fn choose_model(provider: &ProviderKind, _default: &str) -> anyhow::Result<Strin
         println!("  {} {}\n", "Selected:".dimmed(), model.cyan());
         return Ok(model);
     }
+}
+
+fn prompt_custom_model() -> anyhow::Result<String> {
+    let custom = prompt_input("  Enter model name: ")?;
+    let m = custom.trim().to_string();
+    if m.is_empty() {
+        anyhow::bail!("Model name cannot be empty.");
+    }
+    Ok(m)
 }
 
 fn choose_save_location() -> anyhow::Result<PathBuf> {
@@ -397,6 +462,9 @@ fn save_env_file(
         }
         ProviderKind::OpenAI => {
             contents.push_str(&format!("OPENAI_API_KEY={}\n", api_key));
+        }
+        ProviderKind::Ollama => {
+            // No API key needed for Ollama
         }
     }
 

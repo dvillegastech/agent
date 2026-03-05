@@ -1,18 +1,27 @@
 mod agent;
 mod cli;
 mod config;
+mod context;
 mod cost;
 mod error;
 mod export;
+mod git;
 mod markdown;
+#[allow(dead_code)]
+mod mcp;
 mod onboarding;
+mod rag;
 mod retry;
+#[allow(dead_code)]
+mod sandbox;
+mod session;
 mod streaming;
 mod tools;
 mod types;
 
 use std::path::PathBuf;
 
+use chrono::Local;
 use clap::Parser;
 use colored::Colorize;
 use rustyline::error::ReadlineError;
@@ -43,33 +52,54 @@ fn print_banner() {
     );
 }
 
-async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
+async fn run_interactive(mut runner: AgentRunner, config: &AgentConfig) -> anyhow::Result<()> {
     print_banner();
+
+    // Show provider info
+    println!(
+        "  {} {} ({})\n",
+        "Model:".dimmed(),
+        config.model.bright_white(),
+        config.provider.to_string().cyan()
+    );
 
     println!(
         "{}",
         "  Type your message and press Enter. Commands:".dimmed()
     );
-    println!("{}", "    /clear   - Clear conversation history".dimmed());
-    println!("{}", "    /stats   - Show conversation stats & cost".dimmed());
-    println!("{}", "    /cost    - Show cost breakdown".dimmed());
+    println!("{}", "    /clear    - Clear conversation history".dimmed());
+    println!("{}", "    /stats    - Show conversation stats & cost".dimmed());
+    println!("{}", "    /cost     - Show cost breakdown".dimmed());
     println!(
         "{}",
-        "    /export  - Export conversation (md/json)".dimmed()
+        "    /export   - Export conversation (md/json)".dimmed()
     );
     println!(
         "{}",
-        "    /multi   - Toggle multi-line input mode".dimmed()
+        "    /multi    - Toggle multi-line input mode".dimmed()
     );
-    println!("{}", "    /help    - Show this help".dimmed());
     println!(
         "{}",
-        "    /quit    - Exit (or Ctrl+D / Ctrl+C)".dimmed()
+        "    /save     - Save current session".dimmed()
+    );
+    println!(
+        "{}",
+        "    /sessions - List saved sessions".dimmed()
+    );
+    println!(
+        "{}",
+        "    /git      - Show git status".dimmed()
+    );
+    println!("{}", "    /help     - Show this help".dimmed());
+    println!(
+        "{}",
+        "    /quit     - Exit (or Ctrl+D / Ctrl+C)".dimmed()
     );
     println!();
 
     let mut rl = DefaultEditor::new()?;
     let mut multiline_mode = false;
+    let mut current_session = session::SavedSession::new(&config.model);
 
     let history_path = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -113,6 +143,18 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
         // Handle slash commands
         match input {
             "/quit" | "/exit" | "/q" => {
+                // Auto-save session
+                current_session.messages = runner.get_messages().to_vec();
+                current_session.updated_at =
+                    Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                if !current_session.messages.is_empty() {
+                    if let Ok(path) = session::save_session(&current_session) {
+                        eprintln!(
+                            "{}",
+                            format!("  Session saved: {}", path.display()).dimmed()
+                        );
+                    }
+                }
                 println!("\n{}", runner.cost_summary().dimmed());
                 println!("{}", "Goodbye!".bright_cyan());
                 break;
@@ -124,6 +166,14 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
             }
             "/stats" => {
                 println!("{}", runner.stats().dimmed());
+                if git::is_git_repo() {
+                    println!(
+                        "  {}: {} ({})",
+                        "Git".cyan(),
+                        git::current_branch().unwrap_or_else(|| "detached".into()),
+                        git::status_summary()
+                    );
+                }
                 continue;
             }
             "/cost" => {
@@ -139,6 +189,58 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
                     );
                 } else {
                     println!("{}", "Multi-line mode OFF.".yellow());
+                }
+                continue;
+            }
+            "/save" => {
+                current_session.messages = runner.get_messages().to_vec();
+                current_session.updated_at =
+                    Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                match session::save_session(&current_session) {
+                    Ok(path) => println!(
+                        "{} {} ({})",
+                        "Session saved:".green(),
+                        &current_session.id[..8],
+                        path.display()
+                    ),
+                    Err(e) => eprintln!("{} {}", "Save failed:".red(), e),
+                }
+                continue;
+            }
+            "/sessions" => {
+                match session::list_sessions(10) {
+                    Ok(sessions) if sessions.is_empty() => {
+                        println!("{}", "No saved sessions.".dimmed());
+                    }
+                    Ok(sessions) => {
+                        println!("{}", "Recent sessions:".bright_white());
+                        for (id, updated, msg_count) in &sessions {
+                            println!(
+                                "  {} | {} | {} messages",
+                                id.bright_cyan(),
+                                updated.dimmed(),
+                                msg_count
+                            );
+                        }
+                        println!(
+                            "{}",
+                            "  Use --resume <id> to continue a session.".dimmed()
+                        );
+                    }
+                    Err(e) => eprintln!("{} {}", "Error:".red(), e),
+                }
+                continue;
+            }
+            "/git" => {
+                if git::is_git_repo() {
+                    println!(
+                        "  {}: {}",
+                        "Branch".cyan(),
+                        git::current_branch().unwrap_or_else(|| "detached".into())
+                    );
+                    println!("  {}: {}", "Status".cyan(), git::status_summary());
+                } else {
+                    println!("{}", "Not a git repository.".yellow());
                 }
                 continue;
             }
@@ -169,6 +271,9 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
                     "/export [format] [file]".cyan()
                 );
                 println!("  {} - Toggle multi-line input mode", "/multi".cyan());
+                println!("  {} - Save current session", "/save".cyan());
+                println!("  {} - List saved sessions", "/sessions".cyan());
+                println!("  {} - Show git status", "/git".cyan());
                 println!("  {} - Show this help", "/help".cyan());
                 println!("  {} - Exit", "/quit".cyan());
                 continue;
@@ -181,6 +286,12 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
             Ok(_response) => {
                 // Response was already streamed to stdout; just add spacing
                 println!();
+
+                // Auto-commit if enabled
+                if config.security.git_auto_commit && git::is_git_repo() {
+                    let short_input: String = input.chars().take(50).collect();
+                    git::auto_commit(&short_input);
+                }
             }
             Err(e) => {
                 eprintln!("\n{} {}\n", "Error:".red().bold(), e);
@@ -219,7 +330,6 @@ fn read_multiline(rl: &mut DefaultEditor) -> std::result::Result<String, Readlin
 
 async fn run_single(mut runner: AgentRunner, prompt: &str) -> anyhow::Result<()> {
     let _response = runner.process_message(prompt).await?;
-    // Response was already streamed to stdout
     println!();
     eprintln!("\n{}", runner.cost_summary().dimmed());
     Ok(())
@@ -246,6 +356,16 @@ fn show_config(config: &AgentConfig) {
         "  {}: {}",
         "Shell confirmation".cyan(),
         config.security.require_shell_confirmation
+    );
+    println!(
+        "  {}: {}",
+        "Sandbox mode".cyan(),
+        config.security.sandbox_mode
+    );
+    println!(
+        "  {}: {}",
+        "Git auto-commit".cyan(),
+        config.security.git_auto_commit
     );
     println!(
         "  {}: {:?}",
@@ -327,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref provider) = cli.provider {
         config.provider = match provider.to_lowercase().as_str() {
             "openai" => ProviderKind::OpenAI,
+            "ollama" => ProviderKind::Ollama,
             _ => ProviderKind::Anthropic,
         };
     }
@@ -340,6 +461,20 @@ async fn main() -> anyhow::Result<()> {
         config.security.require_shell_confirmation = false;
     }
 
+    // Load project context from RUSTCLAW.md
+    if let Some(project_ctx) = context::load_project_context() {
+        config.system_prompt.push_str("\n\n--- Project Instructions (from RUSTCLAW.md) ---\n");
+        config.system_prompt.push_str(&project_ctx);
+    }
+
+    // Build codebase index for RAG
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let index = rag::CodebaseIndex::build(&cwd);
+    index.print_stats();
+    if !index.entries.is_empty() {
+        config.system_prompt.push_str(&index.summary());
+    }
+
     // Build components
     let guard = SecurityGuard::new(config.security.clone());
     let executor = ToolExecutor::new(guard);
@@ -349,6 +484,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref prompt) = cli.prompt {
         run_single(runner, prompt).await
     } else {
-        run_interactive(runner).await
+        run_interactive(runner, &config).await
     }
 }

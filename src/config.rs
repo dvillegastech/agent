@@ -8,6 +8,7 @@ use std::path::PathBuf;
 pub enum ProviderKind {
     Anthropic,
     OpenAI,
+    Ollama,
 }
 
 impl std::fmt::Display for ProviderKind {
@@ -15,12 +16,14 @@ impl std::fmt::Display for ProviderKind {
         match self {
             ProviderKind::Anthropic => write!(f, "anthropic"),
             ProviderKind::OpenAI => write!(f, "openai"),
+            ProviderKind::Ollama => write!(f, "ollama"),
         }
     }
 }
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
+const DEFAULT_OLLAMA_MODEL: &str = "qwen3:8b";
 
 /// Configuración de seguridad del agente.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +38,10 @@ pub struct SecurityConfig {
     pub command_timeout_secs: u64,
     /// Si se requiere confirmación del usuario para comandos shell.
     pub require_shell_confirmation: bool,
+    /// Sandbox mode for shell execution.
+    pub sandbox_mode: String,
+    /// Whether to auto-commit file changes in git.
+    pub git_auto_commit: bool,
 }
 
 impl Default for SecurityConfig {
@@ -56,6 +63,8 @@ impl Default for SecurityConfig {
             max_file_size: 10 * 1024 * 1024,
             command_timeout_secs: 30,
             require_shell_confirmation: true,
+            sandbox_mode: "none".into(),
+            git_auto_commit: false,
         }
     }
 }
@@ -103,23 +112,30 @@ impl AgentConfig {
             .as_str()
         {
             "openai" => ProviderKind::OpenAI,
+            "ollama" => ProviderKind::Ollama,
             _ => ProviderKind::Anthropic,
         };
 
-        let api_key_env = match provider {
-            ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-            ProviderKind::OpenAI => "OPENAI_API_KEY",
+        // Ollama doesn't need an API key
+        let api_key = if provider == ProviderKind::Ollama {
+            std::env::var("OLLAMA_API_KEY").unwrap_or_default()
+        } else {
+            let api_key_env = match provider {
+                ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
+                ProviderKind::OpenAI => "OPENAI_API_KEY",
+                ProviderKind::Ollama => unreachable!(),
+            };
+            std::env::var(api_key_env).map_err(|_| {
+                AgentError::Config(format!(
+                    "Missing {api_key_env}. Set it in your environment or .env file."
+                ))
+            })?
         };
-
-        let api_key = std::env::var(api_key_env).map_err(|_| {
-            AgentError::Config(format!(
-                "Missing {api_key_env}. Set it in your environment or .env file."
-            ))
-        })?;
 
         let model = std::env::var("RUSTCLAW_MODEL").unwrap_or_else(|_| match provider {
             ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL.into(),
             ProviderKind::OpenAI => DEFAULT_OPENAI_MODEL.into(),
+            ProviderKind::Ollama => DEFAULT_OLLAMA_MODEL.into(),
         });
 
         let base_url = std::env::var("RUSTCLAW_BASE_URL").ok();
@@ -153,6 +169,7 @@ impl AgentConfig {
         match self.provider {
             ProviderKind::Anthropic => "https://api.anthropic.com".into(),
             ProviderKind::OpenAI => "https://api.openai.com".into(),
+            ProviderKind::Ollama => "http://localhost:11434".into(),
         }
     }
 }

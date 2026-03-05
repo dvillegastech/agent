@@ -44,7 +44,10 @@ impl StreamingClient {
     ) -> Result<LlmResponse> {
         match self.provider {
             ProviderKind::Anthropic => self.stream_anthropic(messages, tools, system).await,
-            ProviderKind::OpenAI => self.stream_openai(messages, tools, system).await,
+            // Ollama uses OpenAI-compatible API
+            ProviderKind::OpenAI | ProviderKind::Ollama => {
+                self.stream_openai(messages, tools, system).await
+            }
         }
     }
 

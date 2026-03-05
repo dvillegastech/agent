@@ -73,6 +73,10 @@ fn model_pricing(model: &str) -> (f64, f64) {
         m if m.contains("gpt-4o-mini") => (0.15, 0.60),
         m if m.contains("gpt-4o") => (2.50, 10.0),
         m if m.contains("gpt-4-turbo") => (10.0, 30.0),
+        // Ollama / local models (free)
+        m if m.contains("llama") || m.contains("qwen") || m.contains("mistral")
+            || m.contains("codestral") || m.contains("deepseek") || m.contains("phi")
+            || m.contains("gemma") => (0.0, 0.0),
         // Default fallback
         _ => (3.0, 15.0),
     }
