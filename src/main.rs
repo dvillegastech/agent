@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod context;
 mod cost;
+mod dashboard;
 mod discord;
 mod error;
 mod export;
@@ -487,6 +488,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Discord { ref token }) => {
             return discord::run_discord_bot(config, token).await;
+        }
+        Some(Commands::Dashboard { ref host, port }) => {
+            return dashboard::run_dashboard(config, host, port).await;
         }
         _ => {}
     }

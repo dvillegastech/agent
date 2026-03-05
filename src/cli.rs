@@ -61,4 +61,13 @@ pub enum Commands {
         #[arg(long, env = "DISCORD_BOT_TOKEN")]
         token: String,
     },
+    /// Start Web Admin Dashboard
+    Dashboard {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
 }
