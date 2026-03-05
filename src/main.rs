@@ -3,8 +3,10 @@ mod cli;
 mod config;
 mod context;
 mod cost;
+mod discord;
 mod error;
 mod export;
+mod gateway;
 mod git;
 mod markdown;
 #[allow(dead_code)]
@@ -16,6 +18,7 @@ mod retry;
 mod sandbox;
 mod session;
 mod streaming;
+mod telegram;
 mod tools;
 mod types;
 
@@ -475,7 +478,21 @@ async fn main() -> anyhow::Result<()> {
         config.system_prompt.push_str(&index.summary());
     }
 
-    // Build components
+    // Handle messaging/gateway subcommands
+    match cli.command {
+        Some(Commands::Gateway { ref host, port }) => {
+            return gateway::run_gateway(config, host, port).await;
+        }
+        Some(Commands::Telegram { ref token }) => {
+            return telegram::run_telegram_bot(config, token).await;
+        }
+        Some(Commands::Discord { ref token }) => {
+            return discord::run_discord_bot(config, token).await;
+        }
+        _ => {}
+    }
+
+    // Build components for interactive/single modes
     let guard = SecurityGuard::new(config.security.clone());
     let executor = ToolExecutor::new(guard);
     let runner = AgentRunner::new(&config, executor);

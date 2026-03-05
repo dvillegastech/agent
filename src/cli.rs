@@ -40,4 +40,25 @@ pub enum Commands {
     Init,
     /// Show current configuration
     Config,
+    /// Start HTTP Gateway API server
+    Gateway {
+        /// Host to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// Port to listen on
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+    },
+    /// Start Telegram bot
+    Telegram {
+        /// Telegram bot token (or set TELEGRAM_BOT_TOKEN env var)
+        #[arg(long, env = "TELEGRAM_BOT_TOKEN")]
+        token: String,
+    },
+    /// Start Discord bot
+    Discord {
+        /// Discord bot token (or set DISCORD_BOT_TOKEN env var)
+        #[arg(long, env = "DISCORD_BOT_TOKEN")]
+        token: String,
+    },
 }

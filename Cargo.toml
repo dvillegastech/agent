@@ -58,5 +58,16 @@ regex = "1"
 # Dirs for config paths
 dirs = "6"
 
+# HTTP Gateway (axum)
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Telegram bot
+teloxide = { version = "0.13", features = ["macros"] }
+log = "0.4"
+
+# Discord bot
+serenity = { version = "0.12", features = ["client", "gateway", "model"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
