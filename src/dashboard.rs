@@ -24,30 +24,12 @@ use crate::session;
 
 // ─── Shared Dashboard State ─────────────────────────────────────────
 
-/// Metrics collected in real-time across all integrations.
-#[derive(Debug, Clone, Serialize)]
+/// Dashboard state for logs and active sessions.
+/// Token/cost metrics are read directly from AgentRunner's CostTracker.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DashboardMetrics {
-    pub total_requests: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cost_usd: f64,
     pub active_sessions: Vec<ActiveSession>,
     pub recent_logs: Vec<LogEntry>,
-    pub uptime_secs: u64,
-}
-
-impl Default for DashboardMetrics {
-    fn default() -> Self {
-        Self {
-            total_requests: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cost_usd: 0.0,
-            active_sessions: Vec::new(),
-            recent_logs: Vec::new(),
-            uptime_secs: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,14 +85,6 @@ impl DashboardState {
         let _ = self.events_tx.send("update".into());
     }
 
-    async fn record_request(&self, input_tokens: u64, output_tokens: u64, cost: f64) {
-        let mut metrics = self.metrics.lock().await;
-        metrics.total_requests += 1;
-        metrics.total_input_tokens += input_tokens;
-        metrics.total_output_tokens += output_tokens;
-        metrics.total_cost_usd += cost;
-        let _ = self.events_tx.send("update".into());
-    }
 }
 
 // ─── Launch Dashboard ───────────────────────────────────────────────
@@ -569,35 +543,48 @@ async fn page_chat(_state: State<Arc<DashboardState>>) -> Html<String> {
     </div>
     <div class="chat-container">
       <div class="chat-messages" id="chat-msgs"></div>
-      <form class="chat-input-area" hx-post="/api/chat" hx-swap="none"
+      <form class="chat-input-area" id="chat-form"
+            hx-post="/api/chat" hx-swap="none"
+            hx-on::before-request="captureMessage()"
             hx-on::after-request="handleChatResponse(event)">
         <input type="text" name="message" class="chat-input" placeholder="Type a message..."
                autocomplete="off" id="chat-input">
-        <button type="submit" class="btn">Send</button>
+        <button type="submit" class="btn" id="chat-send">Send</button>
       </form>
     </div>
     <script>
-      function handleChatResponse(event) {
-        const input = document.getElementById('chat-input');
-        const msgs = document.getElementById('chat-msgs');
-        const userMsg = input.value;
-        input.value = '';
+      var pendingUserMsg = '';
 
-        // Add user message
-        const userDiv = document.createElement('div');
+      function captureMessage() {
+        var input = document.getElementById('chat-input');
+        pendingUserMsg = input.value;
+        input.value = '';
+        document.getElementById('chat-send').disabled = true;
+        document.getElementById('chat-send').textContent = '...';
+
+        // Add user message bubble immediately
+        var msgs = document.getElementById('chat-msgs');
+        var userDiv = document.createElement('div');
         userDiv.className = 'chat-msg user';
-        userDiv.textContent = userMsg;
+        userDiv.textContent = pendingUserMsg;
         msgs.appendChild(userDiv);
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+
+      function handleChatResponse(event) {
+        var msgs = document.getElementById('chat-msgs');
+        document.getElementById('chat-send').disabled = false;
+        document.getElementById('chat-send').textContent = 'Send';
 
         // Parse response
         try {
-          const data = JSON.parse(event.detail.xhr.responseText);
-          const assistantDiv = document.createElement('div');
+          var data = JSON.parse(event.detail.xhr.responseText);
+          var assistantDiv = document.createElement('div');
           assistantDiv.className = 'chat-msg assistant';
           assistantDiv.textContent = data.response || data.error || 'No response';
           msgs.appendChild(assistantDiv);
         } catch(e) {
-          const errDiv = document.createElement('div');
+          var errDiv = document.createElement('div');
           errDiv.className = 'chat-msg assistant';
           errDiv.textContent = 'Error processing response';
           msgs.appendChild(errDiv);
@@ -662,7 +649,6 @@ async fn page_logs(_state: State<Arc<DashboardState>>) -> Html<String> {
 // ─── API Endpoints (HTMX partials) ─────────────────────────────────
 
 async fn api_stats(State(state): State<Arc<DashboardState>>) -> Html<String> {
-    let metrics = state.metrics.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
 
     let uptime_str = if uptime >= 3600 {
@@ -673,15 +659,16 @@ async fn api_stats(State(state): State<Arc<DashboardState>>) -> Html<String> {
         format!("{}s", uptime)
     };
 
-    // Get runner stats
+    // Read real metrics from the runner's CostTracker
     let runner = state.runner.lock().await;
     let msg_count = runner.get_messages().len();
+    let (requests, input_tokens, output_tokens, cost_usd) = runner.cost_metrics();
     drop(runner);
 
-    let cost_str = if metrics.total_cost_usd >= 1.0 {
-        format!("${:.2}", metrics.total_cost_usd)
+    let cost_str = if cost_usd >= 1.0 {
+        format!("${:.2}", cost_usd)
     } else {
-        format!("${:.4}", metrics.total_cost_usd)
+        format!("${:.4}", cost_usd)
     };
 
     Html(format!(
@@ -717,9 +704,9 @@ async fn api_stats(State(state): State<Arc<DashboardState>>) -> Html<String> {
     <div class="sub">since dashboard started</div>
   </div>
 </div>"##,
-        requests = metrics.total_requests,
-        input_tokens = format_number(metrics.total_input_tokens),
-        output_tokens = format_number(metrics.total_output_tokens),
+        requests = requests,
+        input_tokens = format_number(input_tokens),
+        output_tokens = format_number(output_tokens),
         cost = cost_str,
         messages = msg_count,
         uptime = uptime_str,
@@ -744,6 +731,8 @@ async fn api_sessions_list(_state: State<Arc<DashboardState>>) -> Html<String> {
   <td>{updated}</td>
   <td>{msg_count}</td>
 </tr>"#,
+            id = html_escape(id),
+            updated = html_escape(updated),
         ));
     }
 
@@ -860,28 +849,34 @@ async fn api_chat(
         .add_log("info", "dashboard", &format!("User: {}", truncate_str(&message, 100)))
         .await;
 
-    let mut runner = state.runner.lock().await;
-    match runner.process_message(&message).await {
+    let result = {
+        let mut runner = state.runner.lock().await;
+        runner.process_message(&message).await
+    };
+    // Runner lock dropped here, safe to acquire metrics lock in add_log
+
+    match result {
         Ok(response) => {
-            // Record approximate metrics
-            state.record_request(0, 0, 0.0).await;
             state
                 .add_log("info", "dashboard", &format!("Assistant: {}", truncate_str(&response, 100)))
                 .await;
             Json(serde_json::json!({"response": response}))
         }
         Err(e) => {
+            let err_msg = e.to_string();
             state
-                .add_log("error", "dashboard", &format!("Error: {e}"))
+                .add_log("error", "dashboard", &format!("Error: {err_msg}"))
                 .await;
-            Json(serde_json::json!({"error": e.to_string()}))
+            Json(serde_json::json!({"error": err_msg}))
         }
     }
 }
 
 async fn api_clear(State(state): State<Arc<DashboardState>>) -> Json<serde_json::Value> {
-    let mut runner = state.runner.lock().await;
-    runner.clear_conversation();
+    {
+        let mut runner = state.runner.lock().await;
+        runner.clear_conversation();
+    }
     state
         .add_log("info", "dashboard", "Conversation cleared")
         .await;
