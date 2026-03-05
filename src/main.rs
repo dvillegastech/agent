@@ -21,6 +21,7 @@ mod streaming;
 mod telegram;
 mod tools;
 mod types;
+mod utils;
 
 use std::path::PathBuf;
 
@@ -33,8 +34,6 @@ use rustyline::DefaultEditor;
 use crate::agent::runner::AgentRunner;
 use crate::cli::{Cli, Commands};
 use crate::config::{AgentConfig, ProviderKind};
-use crate::tools::executor::ToolExecutor;
-use crate::tools::security::SecurityGuard;
 
 fn print_banner() {
     println!(
@@ -493,9 +492,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build components for interactive/single modes
-    let guard = SecurityGuard::new(config.security.clone());
-    let executor = ToolExecutor::new(guard);
-    let runner = AgentRunner::new(&config, executor);
+    let runner = AgentRunner::from_config(&config);
 
     // Run mode
     if let Some(ref prompt) = cli.prompt {

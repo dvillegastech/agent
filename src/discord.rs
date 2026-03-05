@@ -1,21 +1,41 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use colored::Colorize;
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
+use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::agent::runner::AgentRunner;
 use crate::config::AgentConfig;
-use crate::tools::executor::ToolExecutor;
-use crate::tools::security::SecurityGuard;
+use crate::utils;
 
-/// Key for storing the AgentRunner in serenity's TypeMap.
-struct RunnerKey;
-impl TypeMapKey for RunnerKey {
-    type Value = Arc<TokioMutex<AgentRunner>>;
+/// Per-channel runner map for conversation isolation.
+type ChannelRunners = Arc<TokioMutex<HashMap<ChannelId, Arc<TokioMutex<AgentRunner>>>>>;
+
+/// Shared state stored in serenity's TypeMap.
+struct BotStateKey;
+impl TypeMapKey for BotStateKey {
+    type Value = Arc<BotState>;
+}
+
+struct BotState {
+    config: AgentConfig,
+    runners: ChannelRunners,
+}
+
+/// Get or create a runner for a specific channel.
+async fn get_runner(state: &BotState, channel_id: ChannelId) -> Arc<TokioMutex<AgentRunner>> {
+    let mut runners = state.runners.lock().await;
+    runners
+        .entry(channel_id)
+        .or_insert_with(|| {
+            Arc::new(TokioMutex::new(AgentRunner::from_config(&state.config)))
+        })
+        .clone()
 }
 
 /// Discord event handler.
@@ -56,22 +76,29 @@ impl EventHandler for Handler {
             "{} {}: {}",
             "  [discord]".bright_magenta(),
             user.cyan(),
-            truncate(&text, 80).dimmed()
+            utils::truncate(&text, 80).dimmed()
         );
+
+        // Get bot state (fallible)
+        let state = {
+            let data = ctx.data.read().await;
+            match data.get::<BotStateKey>() {
+                Some(s) => s.clone(),
+                None => {
+                    eprintln!("{} BotState not found in TypeMap", "  [discord error]".red());
+                    return;
+                }
+            }
+        };
 
         // Handle commands
         if text.starts_with('!') {
-            handle_command(&ctx, &msg, &text).await;
+            handle_command(&ctx, &msg, &text, &state).await;
             return;
         }
 
-        // Get runner from data
-        let runner = {
-            let data = ctx.data.read().await;
-            data.get::<RunnerKey>()
-                .expect("RunnerKey must be in TypeMap")
-                .clone()
-        };
+        // Get per-channel runner
+        let runner = get_runner(&state, msg.channel_id).await;
 
         // Show typing indicator
         let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
@@ -89,7 +116,7 @@ impl EventHandler for Handler {
         };
 
         // Split long messages (Discord limit is 2000 chars)
-        for chunk in split_message(&response, 1900) {
+        for chunk in utils::split_message(&response, 1900) {
             if let Err(e) = msg.channel_id.say(&ctx.http, chunk).await {
                 eprintln!("{} Failed to send: {}", "  [discord]".red(), e);
             }
@@ -105,32 +132,35 @@ impl EventHandler for Handler {
     }
 }
 
-async fn handle_command(ctx: &Context, msg: &Message, text: &str) {
+async fn handle_command(ctx: &Context, msg: &Message, text: &str, state: &Arc<BotState>) {
     let cmd = text.split_whitespace().next().unwrap_or("");
-
-    let runner = {
-        let data = ctx.data.read().await;
-        data.get::<RunnerKey>()
-            .expect("RunnerKey must be in TypeMap")
-            .clone()
-    };
+    let channel_id = msg.channel_id;
 
     match cmd {
         "!clear" => {
+            let runner = get_runner(state, channel_id).await;
             let mut runner = runner.lock().await;
             runner.clear_conversation();
-            let _ = msg.channel_id.say(&ctx.http, "Conversation cleared.").await;
+            if let Err(e) = msg.channel_id.say(&ctx.http, "Conversation cleared.").await {
+                eprintln!("{} Failed to send: {}", "  [discord]".red(), e);
+            }
             eprintln!("{} Conversation cleared", "  [discord]".bright_magenta());
         }
         "!stats" => {
+            let runner = get_runner(state, channel_id).await;
             let runner = runner.lock().await;
             let stats = runner.stats();
-            let _ = msg.channel_id.say(&ctx.http, format!("📊 {stats}")).await;
+            if let Err(e) = msg.channel_id.say(&ctx.http, format!("📊 {stats}")).await {
+                eprintln!("{} Failed to send: {}", "  [discord]".red(), e);
+            }
         }
         "!cost" => {
+            let runner = get_runner(state, channel_id).await;
             let runner = runner.lock().await;
             let cost = runner.cost_summary();
-            let _ = msg.channel_id.say(&ctx.http, format!("💰 {cost}")).await;
+            if let Err(e) = msg.channel_id.say(&ctx.http, format!("💰 {cost}")).await {
+                eprintln!("{} Failed to send: {}", "  [discord]".red(), e);
+            }
         }
         "!help" => {
             let help = "**RustClaw Agent**\n\
@@ -140,10 +170,13 @@ async fn handle_command(ctx: &Context, msg: &Message, text: &str) {
                         `!stats` - Show stats\n\
                         `!cost` - Show cost\n\
                         `!help` - Show this help";
-            let _ = msg.channel_id.say(&ctx.http, help).await;
+            if let Err(e) = msg.channel_id.say(&ctx.http, help).await {
+                eprintln!("{} Failed to send: {}", "  [discord]".red(), e);
+            }
         }
         _ => {
             // Unknown command - treat as regular message, process with agent
+            let runner = get_runner(state, channel_id).await;
             let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
             let response = {
                 let mut runner = runner.lock().await;
@@ -152,8 +185,10 @@ async fn handle_command(ctx: &Context, msg: &Message, text: &str) {
                     Err(e) => format!("Error: {e}"),
                 }
             };
-            for chunk in split_message(&response, 1900) {
-                let _ = msg.channel_id.say(&ctx.http, chunk).await;
+            for chunk in utils::split_message(&response, 1900) {
+                if let Err(e) = msg.channel_id.say(&ctx.http, chunk).await {
+                    eprintln!("{} Failed to send: {}", "  [discord]".red(), e);
+                }
             }
         }
     }
@@ -161,12 +196,6 @@ async fn handle_command(ctx: &Context, msg: &Message, text: &str) {
 
 /// Run the Discord bot.
 pub async fn run_discord_bot(config: AgentConfig, token: &str) -> anyhow::Result<()> {
-    let guard = SecurityGuard::new(config.security.clone());
-    let executor = ToolExecutor::new(guard);
-    let runner = AgentRunner::new(&config, executor);
-
-    let shared_runner = Arc::new(TokioMutex::new(runner));
-
     eprintln!(
         "\n{} Discord bot starting...",
         "  [discord]".bright_magenta()
@@ -178,6 +207,11 @@ pub async fn run_discord_bot(config: AgentConfig, token: &str) -> anyhow::Result
         config.provider.to_string().cyan()
     );
 
+    let state = Arc::new(BotState {
+        config,
+        runners: Arc::new(TokioMutex::new(HashMap::new())),
+    });
+
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
@@ -187,10 +221,10 @@ pub async fn run_discord_bot(config: AgentConfig, token: &str) -> anyhow::Result
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create Discord client: {e}"))?;
 
-    // Store runner in client data
+    // Store state in client data
     {
         let mut data = client.data.write().await;
-        data.insert::<RunnerKey>(shared_runner);
+        data.insert::<BotStateKey>(state);
     }
 
     client
@@ -199,45 +233,4 @@ pub async fn run_discord_bot(config: AgentConfig, token: &str) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("Discord bot error: {e}"))?;
 
     Ok(())
-}
-
-/// Split a message into chunks for Discord's 2000 char limit.
-fn split_message(text: &str, max_len: usize) -> Vec<&str> {
-    if text.len() <= max_len {
-        return vec![text];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let mut end = (start + max_len).min(text.len());
-
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-
-        if end < text.len() {
-            if let Some(nl) = text[start..end].rfind('\n') {
-                end = start + nl + 1;
-            }
-        }
-
-        chunks.push(&text[start..end]);
-        start = end;
-    }
-
-    chunks
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
 }

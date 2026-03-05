@@ -9,7 +9,9 @@ use crate::retry;
 use crate::streaming::StreamingClient;
 use crate::tools::all_tool_definitions;
 use crate::tools::executor::ToolExecutor;
+use crate::tools::security::SecurityGuard;
 use crate::types::*;
+use crate::utils;
 
 use super::conversation::Conversation;
 
@@ -35,6 +37,13 @@ impl AgentRunner {
             max_tool_iterations: config.max_tool_iterations,
             cost_tracker: CostTracker::new(&config.model),
         }
+    }
+
+    /// Create an AgentRunner directly from config, building SecurityGuard and ToolExecutor internally.
+    pub fn from_config(config: &AgentConfig) -> Self {
+        let guard = SecurityGuard::new(config.security.clone());
+        let executor = ToolExecutor::new(guard);
+        Self::new(config, executor)
     }
 
     /// Process a user message and return the final text response.
@@ -99,7 +108,7 @@ impl AgentRunner {
                             "{} {} {}",
                             "  [tool]".cyan(),
                             name.bright_cyan(),
-                            format!("({})", truncate_str(&input.to_string(), 80)).dimmed()
+                            format!("({})", utils::truncate_oneline(&input.to_string(), 80)).dimmed()
                         );
                         Some((id.clone(), name.clone(), input.clone()))
                     } else {
@@ -125,7 +134,7 @@ impl AgentRunner {
                                 eprintln!(
                                     "{} {}",
                                     "  [result]".green(),
-                                    truncate_str(&output, 200).dimmed()
+                                    utils::truncate_oneline(&output, 200).dimmed()
                                 );
                                 (output, None)
                             }
@@ -186,25 +195,3 @@ impl AgentRunner {
     }
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    let replaced = s.replace('\n', " ");
-    if replaced.len() <= max {
-        replaced
-    } else {
-        // Find a valid UTF-8 boundary at or before `max`
-        let end = floor_char_boundary(&replaced, max);
-        format!("{}...", &replaced[..end])
-    }
-}
-
-/// Find the largest byte index <= `pos` that is a valid UTF-8 char boundary.
-fn floor_char_boundary(s: &str, pos: usize) -> usize {
-    if pos >= s.len() {
-        return s.len();
-    }
-    let mut i = pos;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}

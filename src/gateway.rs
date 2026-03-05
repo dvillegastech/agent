@@ -13,13 +13,13 @@ use tower_http::cors::CorsLayer;
 
 use crate::agent::runner::AgentRunner;
 use crate::config::AgentConfig;
-use crate::tools::executor::ToolExecutor;
-use crate::tools::security::SecurityGuard;
+use crate::utils;
 
 /// Shared state for the gateway.
 struct GatewayState {
     runner: Mutex<AgentRunner>,
-    config: AgentConfig,
+    model: String,
+    provider: String,
 }
 
 /// Request body for the chat endpoint.
@@ -45,13 +45,12 @@ struct HealthResponse {
 
 /// Start the HTTP gateway server.
 pub async fn run_gateway(config: AgentConfig, host: &str, port: u16) -> anyhow::Result<()> {
-    let guard = SecurityGuard::new(config.security.clone());
-    let executor = ToolExecutor::new(guard);
-    let runner = AgentRunner::new(&config, executor);
+    let runner = AgentRunner::from_config(&config);
 
     let state = Arc::new(GatewayState {
         runner: Mutex::new(runner),
-        config: config.clone(),
+        model: config.model.clone(),
+        provider: config.provider.to_string(),
     });
 
     let app = Router::new()
@@ -102,8 +101,8 @@ async fn health_handler(
 ) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".into(),
-        model: state.config.model.clone(),
-        provider: state.config.provider.to_string(),
+        model: state.model.clone(),
+        provider: state.provider.clone(),
     })
 }
 
@@ -124,7 +123,7 @@ async fn chat_handler(
     eprintln!(
         "{} Received: {}",
         "  [gateway]".bright_magenta(),
-        truncate(&req.message, 80).dimmed()
+        utils::truncate(&req.message, 80).dimmed()
     );
 
     let mut runner = state.runner.lock().await;
@@ -169,16 +168,4 @@ async fn stats_handler(
         "stats": runner.stats(),
         "cost": runner.cost_summary(),
     }))
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
 }

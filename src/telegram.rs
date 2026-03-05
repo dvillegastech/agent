@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use colored::Colorize;
@@ -7,17 +8,30 @@ use tokio::sync::Mutex;
 
 use crate::agent::runner::AgentRunner;
 use crate::config::AgentConfig;
-use crate::tools::executor::ToolExecutor;
-use crate::tools::security::SecurityGuard;
+use crate::utils;
+
+/// Per-chat runner map for conversation isolation.
+type ChatRunners = Arc<Mutex<HashMap<ChatId, Arc<Mutex<AgentRunner>>>>>;
+
+/// Shared config for creating new per-chat runners.
+struct BotState {
+    config: AgentConfig,
+    runners: ChatRunners,
+}
+
+/// Get or create a runner for a specific chat.
+async fn get_runner(state: &Arc<BotState>, chat_id: ChatId) -> Arc<Mutex<AgentRunner>> {
+    let mut runners = state.runners.lock().await;
+    runners
+        .entry(chat_id)
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(AgentRunner::from_config(&state.config)))
+        })
+        .clone()
+}
 
 /// Run the Telegram bot.
 pub async fn run_telegram_bot(config: AgentConfig, token: &str) -> anyhow::Result<()> {
-    let guard = SecurityGuard::new(config.security.clone());
-    let executor = ToolExecutor::new(guard);
-    let runner = AgentRunner::new(&config, executor);
-
-    let shared_runner = Arc::new(Mutex::new(runner));
-
     eprintln!(
         "\n{} Telegram bot starting...",
         "  [telegram]".bright_magenta()
@@ -46,14 +60,19 @@ pub async fn run_telegram_bot(config: AgentConfig, token: &str) -> anyhow::Resul
         }
     }
 
+    let state = Arc::new(BotState {
+        config,
+        runners: Arc::new(Mutex::new(HashMap::new())),
+    });
+
     let handler = Update::filter_message().endpoint(
-        move |bot: Bot, msg: Message, runner: Arc<Mutex<AgentRunner>>| async move {
-            handle_message(bot, msg, runner).await
+        move |bot: Bot, msg: Message, state: Arc<BotState>| async move {
+            handle_message(bot, msg, state).await
         },
     );
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![shared_runner])
+        .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -65,7 +84,7 @@ pub async fn run_telegram_bot(config: AgentConfig, token: &str) -> anyhow::Resul
 async fn handle_message(
     bot: Bot,
     msg: Message,
-    runner: Arc<Mutex<AgentRunner>>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
     let text = match msg.text() {
         Some(t) => t,
@@ -83,13 +102,16 @@ async fn handle_message(
         "{} @{}: {}",
         "  [telegram]".bright_magenta(),
         user.cyan(),
-        truncate(text, 80).dimmed()
+        utils::truncate(text, 80).dimmed()
     );
 
     // Handle bot commands
     if text.starts_with('/') {
-        return handle_command(&bot, chat_id, text, &runner).await;
+        return handle_command(&bot, chat_id, text, &state).await;
     }
+
+    // Get per-chat runner
+    let runner = get_runner(&state, chat_id).await;
 
     // Process with agent
     let response = {
@@ -104,7 +126,7 @@ async fn handle_message(
     };
 
     // Split long messages (Telegram limit is 4096 chars)
-    for chunk in split_message(&response, 4000) {
+    for chunk in utils::split_message(&response, 4000) {
         bot.send_message(chat_id, chunk).await?;
     }
 
@@ -115,7 +137,7 @@ async fn handle_command(
     bot: &Bot,
     chat_id: ChatId,
     text: &str,
-    runner: &Arc<Mutex<AgentRunner>>,
+    state: &Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
     let cmd = text.split_whitespace().next().unwrap_or("");
 
@@ -133,17 +155,20 @@ async fn handle_command(
                 .await?;
         }
         "/clear" => {
+            let runner = get_runner(state, chat_id).await;
             let mut runner = runner.lock().await;
             runner.clear_conversation();
             bot.send_message(chat_id, "Conversation cleared.").await?;
             eprintln!("{} Conversation cleared", "  [telegram]".bright_magenta());
         }
         "/stats" => {
+            let runner = get_runner(state, chat_id).await;
             let runner = runner.lock().await;
             let stats = runner.stats();
             bot.send_message(chat_id, format!("📊 {stats}")).await?;
         }
         "/cost" => {
+            let runner = get_runner(state, chat_id).await;
             let runner = runner.lock().await;
             let cost = runner.cost_summary();
             bot.send_message(chat_id, format!("💰 {cost}")).await?;
@@ -164,47 +189,4 @@ async fn handle_command(
     }
 
     Ok(())
-}
-
-/// Split a message into chunks that fit Telegram's message size limit.
-fn split_message(text: &str, max_len: usize) -> Vec<&str> {
-    if text.len() <= max_len {
-        return vec![text];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let mut end = (start + max_len).min(text.len());
-
-        // Find valid UTF-8 boundary
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-
-        // Try to break at a newline for cleaner splits
-        if end < text.len() {
-            if let Some(nl) = text[start..end].rfind('\n') {
-                end = start + nl + 1;
-            }
-        }
-
-        chunks.push(&text[start..end]);
-        start = end;
-    }
-
-    chunks
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
 }
