@@ -77,8 +77,8 @@ pub struct Usage {
 impl Usage {
     /// Parse usage from a JSON value with configurable key names.
     pub fn from_json(value: &serde_json::Value, input_key: &str, output_key: &str) -> Option<Self> {
-        let input_tokens = value[input_key].as_u64()? as u32;
-        let output_tokens = value[output_key].as_u64()? as u32;
+        let input_tokens = u32::try_from(value[input_key].as_u64()?).unwrap_or(u32::MAX);
+        let output_tokens = u32::try_from(value[output_key].as_u64()?).unwrap_or(u32::MAX);
         Some(Self { input_tokens, output_tokens })
     }
 }

@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use colored::Colorize;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::Client;
@@ -85,10 +86,17 @@ impl StreamingClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let err_body: Value = resp.json().await.unwrap_or_default();
-            let msg = err_body["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown API error");
+            let err_text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&err_text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| {
+                    if err_text.is_empty() {
+                        "Unknown API error".into()
+                    } else {
+                        err_text.chars().take(500).collect()
+                    }
+                });
             return Err(AgentError::Provider(format!(
                 "Anthropic API error ({status}): {msg}"
             )));
@@ -107,7 +115,10 @@ impl StreamingClient {
         while let Some(event) = stream.next().await {
             let event = match event {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("{}", format!("  [stream] SSE error: {e}").dimmed());
+                    continue;
+                }
             };
 
             if event.data == "[DONE]" {
@@ -116,7 +127,10 @@ impl StreamingClient {
 
             let data: Value = match serde_json::from_str(&event.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("{}", format!("  [stream] JSON parse error: {e}").dimmed());
+                    continue;
+                }
             };
 
             match event.event.as_str() {
@@ -166,8 +180,20 @@ impl StreamingClient {
                 }
                 "content_block_stop" => {
                     if in_tool {
-                        let input: Value = serde_json::from_str(&current_tool_input)
-                            .unwrap_or(json!({}));
+                        let input: Value = match serde_json::from_str(&current_tool_input) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "{}",
+                                    format!(
+                                        "  [stream] Warning: malformed tool input JSON for '{}': {e}",
+                                        current_tool_name
+                                    )
+                                    .yellow()
+                                );
+                                json!({})
+                            }
+                        };
                         content_blocks.push(ContentBlock::ToolUse {
                             id: current_tool_id.clone(),
                             name: current_tool_name.clone(),
@@ -177,14 +203,12 @@ impl StreamingClient {
                     }
                 }
                 "message_delta" => {
-                    if let (Some(inp), Some(out)) = (
-                        data["usage"]["input_tokens"].as_u64(),
-                        data["usage"]["output_tokens"].as_u64(),
+                    if let Some(u) = Usage::from_json(
+                        &data["usage"],
+                        "input_tokens",
+                        "output_tokens",
                     ) {
-                        usage = Some(Usage {
-                            input_tokens: inp as u32,
-                            output_tokens: out as u32,
-                        });
+                        usage = Some(u);
                     }
                 }
                 "message_start" => {
@@ -253,10 +277,17 @@ impl StreamingClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let err_body: Value = resp.json().await.unwrap_or_default();
-            let msg = err_body["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown API error");
+            let err_text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&err_text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| {
+                    if err_text.is_empty() {
+                        "Unknown API error".into()
+                    } else {
+                        err_text.chars().take(500).collect()
+                    }
+                });
             return Err(AgentError::Provider(format!(
                 "OpenAI API error ({status}): {msg}"
             )));
@@ -271,7 +302,10 @@ impl StreamingClient {
         while let Some(event) = stream.next().await {
             let event = match event {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("{}", format!("  [stream] SSE error: {e}").dimmed());
+                    continue;
+                }
             };
 
             if event.data == "[DONE]" {
@@ -280,7 +314,10 @@ impl StreamingClient {
 
             let data: Value = match serde_json::from_str(&event.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("{}", format!("  [stream] JSON parse error: {e}").dimmed());
+                    continue;
+                }
             };
 
             if let Some(choices) = data["choices"].as_array() {
@@ -334,7 +371,17 @@ impl StreamingClient {
 
         for (id, name, args) in tool_calls {
             if !name.is_empty() {
-                let input: Value = serde_json::from_str(&args).unwrap_or(json!({}));
+                let input: Value = match serde_json::from_str(&args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "{}",
+                            format!("  [stream] Warning: malformed tool args for '{name}': {e}")
+                                .yellow()
+                        );
+                        json!({})
+                    }
+                };
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
         }
@@ -355,7 +402,17 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<Value> {
                 MessageContent::Blocks(blocks) => {
                     let serialized: Vec<Value> = blocks
                         .iter()
-                        .map(|b| serde_json::to_value(b).unwrap_or(json!(null)))
+                        .filter_map(|b| match serde_json::to_value(b) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                eprintln!(
+                                    "{}",
+                                    format!("  [warn] Failed to serialize content block: {e}")
+                                        .dimmed()
+                                );
+                                None
+                            }
+                        })
                         .collect();
                     json!(serialized)
                 }

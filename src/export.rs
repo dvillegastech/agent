@@ -49,9 +49,15 @@ pub fn to_markdown(messages: &[Message], path: &Path) -> Result<()> {
                             } else {
                                 "Tool result"
                             };
-                            // Truncate very long results
+                            // Truncate very long results (UTF-8 safe)
                             let display = if content.len() > 2000 {
-                                format!("{}...\n\n_(truncated)_", &content[..2000])
+                                let end = content
+                                    .char_indices()
+                                    .take_while(|(i, _)| *i < 2000)
+                                    .last()
+                                    .map(|(i, c)| i + c.len_utf8())
+                                    .unwrap_or(0);
+                                format!("{}...\n\n_(truncated)_", &content[..end])
                             } else {
                                 content.clone()
                             };

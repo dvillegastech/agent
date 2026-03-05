@@ -186,6 +186,20 @@ fn truncate_str(s: &str, max: usize) -> String {
     if replaced.len() <= max {
         replaced
     } else {
-        format!("{}...", &replaced[..max])
+        // Find a valid UTF-8 boundary at or before `max`
+        let end = floor_char_boundary(&replaced, max);
+        format!("{}...", &replaced[..end])
     }
+}
+
+/// Find the largest byte index <= `pos` that is a valid UTF-8 char boundary.
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut i = pos;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }

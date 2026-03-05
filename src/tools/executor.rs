@@ -157,10 +157,15 @@ impl ToolExecutor {
                 ));
             }
 
-            // Truncate excessive output
+            // Truncate excessive output (UTF-8 safe)
             const MAX_OUTPUT: usize = 50_000;
             if result.len() > MAX_OUTPUT {
-                result.truncate(MAX_OUTPUT);
+                // Find valid UTF-8 boundary at or before MAX_OUTPUT
+                let mut end = MAX_OUTPUT;
+                while end > 0 && !result.is_char_boundary(end) {
+                    end -= 1;
+                }
+                result.truncate(end);
                 result.push_str("\n... [output truncated]");
             }
 
