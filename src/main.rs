@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod config;
 mod error;
+mod onboarding;
 mod providers;
 mod tools;
 mod types;
@@ -64,7 +65,6 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
 
     let mut rl = DefaultEditor::new()?;
 
-    // Cargar historial si existe
     let history_path = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("rustclaw")
@@ -86,7 +86,6 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
 
                 let _ = rl.add_history_entry(input);
 
-                // Comandos internos
                 match input {
                     "/quit" | "/exit" | "/q" => {
                         println!("{}", "Goodbye!".bright_cyan());
@@ -112,14 +111,13 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
                     _ => {}
                 }
 
-                // Procesar mensaje con el agente
                 println!();
                 match runner.process_message(input).await {
                     Ok(response) => {
                         println!("\n{}\n", response);
                     }
                     Err(e) => {
-                        eprintln!("\n{} {}\n", "Error:".red().bold(), e.to_string().red());
+                        eprintln!("\n{} {}\n", "Error:".red().bold(), e);
                     }
                 }
             }
@@ -137,9 +135,7 @@ async fn run_interactive(mut runner: AgentRunner) -> anyhow::Result<()> {
         }
     }
 
-    // Guardar historial
     let _ = rl.save_history(&history_path);
-
     Ok(())
 }
 
@@ -162,9 +158,9 @@ fn show_config(config: &AgentConfig) {
         config.max_tool_iterations
     );
     println!(
-        "  {}: {}",
+        "  {}: {}s",
         "Command timeout".cyan(),
-        format!("{}s", config.security.command_timeout_secs)
+        config.security.command_timeout_secs
     );
     println!(
         "  {}: {}",
@@ -183,31 +179,74 @@ fn show_config(config: &AgentConfig) {
     );
 }
 
+/// Try to load config from env, or run onboarding wizard if not configured.
+async fn load_or_onboard_config() -> anyhow::Result<AgentConfig> {
+    match AgentConfig::from_env() {
+        Ok(config) => Ok(config),
+        Err(_) => {
+            // No valid config found - check if this looks like first run
+            if !onboarding::config_exists() {
+                print_banner();
+                println!(
+                    "  {}",
+                    "No configuration found. Starting setup wizard...".yellow()
+                );
+
+                let result = onboarding::run_onboarding().await?;
+
+                // Reload env from the newly written file
+                let _ = dotenvy::from_path(&result.env_file_path);
+
+                Ok(AgentConfig {
+                    provider: result.provider,
+                    api_key: result.api_key,
+                    model: result.model,
+                    ..AgentConfig::default()
+                })
+            } else {
+                // Config file exists but is broken
+                eprintln!(
+                    "{} {}",
+                    "Configuration error:".red().bold(),
+                    "API key not found or invalid."
+                );
+                eprintln!(
+                    "{}",
+                    "Run 'rustclaw init' to reconfigure, or set ANTHROPIC_API_KEY / OPENAI_API_KEY."
+                        .dimmed()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Cargar configuración
-    let mut config = match AgentConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            // Si solo quieren ver la config, no necesitamos API key
-            if matches!(cli.command, Some(Commands::Config)) {
-                let mut c = AgentConfig::default();
-                c.api_key = "<not set>".into();
-                show_config(&c);
-                return Ok(());
-            }
-            eprintln!("{} {}", "Configuration error:".red().bold(), e);
-            eprintln!(
-                "{}",
-                "Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your environment or .env file.".dimmed()
-            );
-            std::process::exit(1);
-        }
-    };
+    // Handle init subcommand first (doesn't need existing config)
+    if matches!(cli.command, Some(Commands::Init)) {
+        print_banner();
+        onboarding::run_onboarding().await?;
+        return Ok(());
+    }
 
-    // Aplicar overrides del CLI
+    // Handle config subcommand (can work without API key)
+    if matches!(cli.command, Some(Commands::Config)) {
+        let config = AgentConfig::from_env().unwrap_or_else(|_| {
+            let mut c = AgentConfig::default();
+            c.api_key = "<not set>".into();
+            c
+        });
+        show_config(&config);
+        return Ok(());
+    }
+
+    // Load config with auto-onboarding for first-time users
+    let mut config = load_or_onboard_config().await?;
+
+    // Apply CLI overrides
     if let Some(ref provider) = cli.provider {
         config.provider = match provider.to_lowercase().as_str() {
             "openai" => ProviderKind::OpenAI,
@@ -224,19 +263,13 @@ async fn main() -> anyhow::Result<()> {
         config.security.require_shell_confirmation = false;
     }
 
-    // Subcomando: config
-    if matches!(cli.command, Some(Commands::Config)) {
-        show_config(&config);
-        return Ok(());
-    }
-
-    // Construir componentes
+    // Build components
     let provider = build_provider(&config);
     let guard = SecurityGuard::new(config.security.clone());
     let executor = ToolExecutor::new(guard);
     let runner = AgentRunner::new(&config, provider, executor);
 
-    // Modo de ejecución
+    // Run mode
     if let Some(ref prompt) = cli.prompt {
         run_single(runner, prompt).await
     } else {

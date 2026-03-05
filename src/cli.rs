@@ -36,6 +36,8 @@ pub struct Cli {
 pub enum Commands {
     /// Start interactive chat session (default)
     Chat,
+    /// Run the configuration wizard (first-time setup)
+    Init,
     /// Show current configuration
     Config,
 }
