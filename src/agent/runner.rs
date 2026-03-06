@@ -193,5 +193,15 @@ impl AgentRunner {
     pub fn get_messages(&self) -> &[crate::types::Message] {
         self.conversation.messages()
     }
+
+    /// Get raw cost metrics for dashboard: (requests, input_tokens, output_tokens, cost_usd).
+    pub fn cost_metrics(&self) -> (u32, u64, u64, f64) {
+        (
+            self.cost_tracker.request_count,
+            self.cost_tracker.total_input_tokens,
+            self.cost_tracker.total_output_tokens,
+            self.cost_tracker.estimated_cost(),
+        )
+    }
 }
 
