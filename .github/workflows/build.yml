@@ -44,6 +44,14 @@ jobs:
         run: cargo tauri build --target aarch64-apple-darwin
         working-directory: crates/rustclaw-tauri
 
+      - name: Ad-hoc codesign app bundle
+        run: |
+          APP=$(find target/aarch64-apple-darwin/release/bundle/macos -name "*.app" -maxdepth 1 | head -1)
+          if [ -n "$APP" ]; then
+            codesign --force --deep --sign - "$APP"
+            echo "Signed: $APP"
+          fi
+
       - name: Upload Tauri app
         uses: actions/upload-artifact@v4
         with:
