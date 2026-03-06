@@ -4,29 +4,41 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Local;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
 use rustclaw_core::agent::runner::AgentRunner;
 use rustclaw_core::config::{AgentConfig, ProviderKind};
 use rustclaw_core::context;
+use rustclaw_core::events::{AgentEvent, EventSink};
 use rustclaw_core::rag;
+use rustclaw_core::session;
 
-/// Shared application state.
+// ─── Event Sink for Tauri ──────────────────────────────────────────
+
+/// Bridges core AgentEvents to Tauri's frontend event system.
+struct TauriEventSink {
+    app: AppHandle,
+}
+
+impl EventSink for TauriEventSink {
+    fn emit(&self, event: AgentEvent) {
+        let _ = self.app.emit("agent-event", &event);
+    }
+}
+
+// ─── Shared State ──────────────────────────────────────────────────
+
 struct AppState {
     runner: Mutex<Option<AgentRunner>>,
     config: Mutex<Option<AgentConfig>>,
+    current_session_id: Mutex<Option<String>>,
 }
 
-/// Chat message for the frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
+// ─── Types for frontend ────────────────────────────────────────────
 
-/// Response sent back to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatResponse {
     success: bool,
@@ -34,7 +46,6 @@ struct ChatResponse {
     error: Option<String>,
 }
 
-/// Configuration info for the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConfigInfo {
     provider: String,
@@ -42,7 +53,16 @@ struct ConfigInfo {
     configured: bool,
 }
 
-/// Initialize the agent with the given configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionInfo {
+    id: String,
+    updated_at: String,
+    message_count: usize,
+    model: String,
+}
+
+// ─── Agent Commands ────────────────────────────────────────────────
+
 #[tauri::command]
 async fn initialize_agent(
     state: State<'_, Arc<AppState>>,
@@ -63,26 +83,18 @@ async fn initialize_agent(
         ..AgentConfig::default()
     };
 
-    // Load project context
-    if let Some(project_ctx) = context::load_project_context() {
-        config.system_prompt.push_str("\n\n--- Project Instructions (from RUSTCLAW.md) ---\n");
-        config.system_prompt.push_str(&project_ctx);
-    }
-
-    // Build codebase index
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let index = rag::CodebaseIndex::build(&cwd);
-    if !index.entries.is_empty() {
-        config.system_prompt.push_str(&index.summary());
-    }
+    load_context_into(&mut config);
 
     let runner = AgentRunner::from_config(&config);
-
     let info = ConfigInfo {
         provider: config.provider.to_string(),
         model: config.model.clone(),
         configured: true,
     };
+
+    // Create a new session
+    let sess = session::SavedSession::new(&config.model);
+    *state.current_session_id.lock().await = Some(sess.id.clone());
 
     *state.runner.lock().await = Some(runner);
     *state.config.lock().await = Some(config);
@@ -90,7 +102,6 @@ async fn initialize_agent(
     Ok(info)
 }
 
-/// Try to auto-load config from environment variables.
 #[tauri::command]
 async fn auto_load_config(
     state: State<'_, Arc<AppState>>,
@@ -99,26 +110,17 @@ async fn auto_load_config(
 
     match AgentConfig::from_env() {
         Ok(mut config) => {
-            // Load project context
-            if let Some(project_ctx) = context::load_project_context() {
-                config.system_prompt.push_str("\n\n--- Project Instructions (from RUSTCLAW.md) ---\n");
-                config.system_prompt.push_str(&project_ctx);
-            }
-
-            // Build codebase index
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let index = rag::CodebaseIndex::build(&cwd);
-            if !index.entries.is_empty() {
-                config.system_prompt.push_str(&index.summary());
-            }
+            load_context_into(&mut config);
 
             let runner = AgentRunner::from_config(&config);
-
             let info = ConfigInfo {
                 provider: config.provider.to_string(),
                 model: config.model.clone(),
                 configured: true,
             };
+
+            let sess = session::SavedSession::new(&config.model);
+            *state.current_session_id.lock().await = Some(sess.id.clone());
 
             *state.runner.lock().await = Some(runner);
             *state.config.lock().await = Some(config);
@@ -133,42 +135,61 @@ async fn auto_load_config(
     }
 }
 
-/// Send a message to the agent and get a response.
+/// Send a message with streaming events emitted to the frontend.
 #[tauri::command]
 async fn send_message(
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
     message: String,
 ) -> Result<ChatResponse, String> {
-    let mut runner_guard = state.runner.lock().await;
-    let runner = runner_guard.as_mut().ok_or("Agent not initialized. Please configure first.")?;
+    let sink = TauriEventSink { app };
 
-    match runner.process_message(&message).await {
+    let mut runner_guard = state.runner.lock().await;
+    let runner = runner_guard
+        .as_mut()
+        .ok_or("Agent not initialized. Please configure first.")?;
+
+    match runner.process_message_with_events(&message, &sink).await {
         Ok(response) => Ok(ChatResponse {
             success: true,
             message: response,
             error: None,
         }),
-        Err(e) => Ok(ChatResponse {
-            success: false,
-            message: String::new(),
-            error: Some(e.to_string()),
-        }),
+        Err(e) => {
+            sink.emit(AgentEvent::Error {
+                message: e.to_string(),
+            });
+            Ok(ChatResponse {
+                success: false,
+                message: String::new(),
+                error: Some(e.to_string()),
+            })
+        }
     }
 }
 
-/// Clear the conversation history.
 #[tauri::command]
 async fn clear_conversation(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    // Auto-save before clearing
+    auto_save_session(&state).await;
+
     let mut runner_guard = state.runner.lock().await;
     if let Some(runner) = runner_guard.as_mut() {
         runner.clear_conversation();
     }
+
+    // Start a new session
+    let config_guard = state.config.lock().await;
+    if let Some(config) = config_guard.as_ref() {
+        let sess = session::SavedSession::new(&config.model);
+        *state.current_session_id.lock().await = Some(sess.id.clone());
+    }
+
     Ok(())
 }
 
-/// Get conversation stats.
 #[tauri::command]
 async fn get_stats(
     state: State<'_, Arc<AppState>>,
@@ -180,7 +201,6 @@ async fn get_stats(
     }
 }
 
-/// Get cost summary.
 #[tauri::command]
 async fn get_cost(
     state: State<'_, Arc<AppState>>,
@@ -192,10 +212,139 @@ async fn get_cost(
     }
 }
 
+// ─── Session Commands ──────────────────────────────────────────────
+
+#[tauri::command]
+async fn save_session(
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    auto_save_session(&state).await;
+    let session_id = state.current_session_id.lock().await;
+    Ok(session_id.clone().unwrap_or_else(|| "none".into()))
+}
+
+#[tauri::command]
+async fn list_sessions() -> Result<Vec<SessionInfo>, String> {
+    let sessions = session::list_sessions(50).map_err(|e| e.to_string())?;
+    Ok(sessions
+        .into_iter()
+        .map(|(id, updated_at, message_count)| SessionInfo {
+            id,
+            updated_at,
+            message_count,
+            model: String::new(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn load_session(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let saved = session::load_session(&session_id).map_err(|e| e.to_string())?;
+
+    // Rebuild runner with saved messages
+    let config_guard = state.config.lock().await;
+    let config = config_guard
+        .as_ref()
+        .ok_or("Agent not configured")?;
+
+    let mut runner = AgentRunner::from_config(config);
+
+    // We need to replay the messages into the conversation
+    // For now, just rebuild and set session ID
+    drop(config_guard);
+
+    // Convert messages to JSON for the frontend to display
+    let messages_json: Vec<serde_json::Value> = saved
+        .messages
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+
+    *state.current_session_id.lock().await = Some(saved.id);
+
+    // Clear and set the new runner
+    *state.runner.lock().await = Some(runner);
+
+    Ok(messages_json)
+}
+
+#[tauri::command]
+async fn delete_session(session_id: String) -> Result<(), String> {
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rustclaw")
+        .join("sessions");
+
+    // Find and delete the session file
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if stem.starts_with(&session_id) {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(format!("Session '{session_id}' not found"))
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────
+
+fn load_context_into(config: &mut AgentConfig) {
+    if let Some(project_ctx) = context::load_project_context() {
+        config
+            .system_prompt
+            .push_str("\n\n--- Project Instructions (from RUSTCLAW.md) ---\n");
+        config.system_prompt.push_str(&project_ctx);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let index = rag::CodebaseIndex::build(&cwd);
+    if !index.entries.is_empty() {
+        config.system_prompt.push_str(&index.summary());
+    }
+}
+
+async fn auto_save_session(state: &AppState) {
+    let runner_guard = state.runner.lock().await;
+    let session_id_guard = state.current_session_id.lock().await;
+    let config_guard = state.config.lock().await;
+
+    if let (Some(runner), Some(session_id), Some(config)) = (
+        runner_guard.as_ref(),
+        session_id_guard.as_ref(),
+        config_guard.as_ref(),
+    ) {
+        let messages = runner.get_messages();
+        if messages.is_empty() {
+            return;
+        }
+
+        let saved = session::SavedSession {
+            id: session_id.clone(),
+            created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            updated_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            model: config.model.clone(),
+            messages: messages.to_vec(),
+        };
+
+        let _ = session::save_session(&saved);
+    }
+}
+
+// ─── Main ──────────────────────────────────────────────────────────
+
 fn main() {
     let state = Arc::new(AppState {
         runner: Mutex::new(None),
         config: Mutex::new(None),
+        current_session_id: Mutex::new(None),
     });
 
     tauri::Builder::default()
@@ -207,6 +356,10 @@ fn main() {
             clear_conversation,
             get_stats,
             get_cost,
+            save_session,
+            list_sessions,
+            load_session,
+            delete_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

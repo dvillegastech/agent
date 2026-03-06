@@ -41,38 +41,53 @@
 
     <!-- Chat Screen -->
     <div id="chat-screen" class="screen hidden">
-      <!-- Header -->
-      <header class="chat-header">
-        <div class="header-left">
-          <h1>RustClaw</h1>
-          <span id="model-badge" class="badge"></span>
+      <!-- Sessions Sidebar -->
+      <div id="sessions-sidebar" class="sidebar hidden">
+        <div class="sidebar-header">
+          <h2>Sessions</h2>
+          <button id="btn-close-sidebar" class="btn-icon" title="Close">X</button>
         </div>
-        <div class="header-right">
-          <button id="btn-stats" class="btn-icon" title="Stats">Stats</button>
-          <button id="btn-clear" class="btn-icon" title="Clear">Clear</button>
-        </div>
-      </header>
-
-      <!-- Messages -->
-      <div id="messages" class="messages-container">
-        <div class="welcome-msg">
-          <p>Welcome! Send a message to start chatting with the AI agent.</p>
-          <p class="hint">The agent can read files, write code, execute commands, and search your codebase.</p>
+        <div id="sessions-list" class="sessions-list">
+          <p class="sidebar-empty">No saved sessions</p>
         </div>
       </div>
 
-      <!-- Stats bar -->
-      <div id="stats-bar" class="stats-bar hidden"></div>
+      <!-- Main Chat Area -->
+      <div class="chat-main">
+        <!-- Header -->
+        <header class="chat-header">
+          <div class="header-left">
+            <h1>RustClaw</h1>
+            <span id="model-badge" class="badge"></span>
+          </div>
+          <div class="header-right">
+            <button id="btn-sessions" class="btn-icon" title="Sessions">Sessions</button>
+            <button id="btn-stats" class="btn-icon" title="Stats">Stats</button>
+            <button id="btn-clear" class="btn-icon" title="Clear">Clear</button>
+          </div>
+        </header>
 
-      <!-- Input -->
-      <div class="input-container">
-        <textarea id="message-input" placeholder="Type your message..." rows="1"></textarea>
-        <button id="btn-send" class="btn-send" title="Send">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="22" y1="2" x2="11" y2="13"></line>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-          </svg>
-        </button>
+        <!-- Messages -->
+        <div id="messages" class="messages-container">
+          <div class="welcome-msg">
+            <p>Welcome! Send a message to start chatting with the AI agent.</p>
+            <p class="hint">The agent can read files, write code, execute commands, and search your codebase.</p>
+          </div>
+        </div>
+
+        <!-- Stats bar -->
+        <div id="stats-bar" class="stats-bar hidden"></div>
+
+        <!-- Input -->
+        <div class="input-container">
+          <textarea id="message-input" placeholder="Type your message..." rows="1"></textarea>
+          <button id="btn-send" class="btn-send" title="Send">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
   </div>

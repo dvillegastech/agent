@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::config::{AgentConfig, ProviderKind};
 use crate::error::{AgentError, Result};
+use crate::events::{AgentEvent, EventSink};
 use crate::types::*;
 
 /// Streaming chat client that prints tokens as they arrive.
@@ -47,6 +48,24 @@ impl StreamingClient {
             // Ollama uses OpenAI-compatible API
             ProviderKind::OpenAI | ProviderKind::Ollama => {
                 self.stream_openai(messages, tools, system).await
+            }
+        }
+    }
+
+    /// Stream a chat response, emitting events to a sink instead of stdout.
+    pub async fn stream_chat_with_events(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+        sink: &dyn EventSink,
+    ) -> Result<LlmResponse> {
+        match self.provider {
+            ProviderKind::Anthropic => {
+                self.stream_anthropic_events(messages, tools, system, sink).await
+            }
+            ProviderKind::OpenAI | ProviderKind::Ollama => {
+                self.stream_openai_events(messages, tools, system, sink).await
             }
         }
     }
@@ -385,6 +404,264 @@ impl StreamingClient {
                         json!({})
                     }
                 };
+                content.push(ContentBlock::ToolUse { id, name, input });
+            }
+        }
+
+        Ok(LlmResponse { content, usage })
+    }
+
+    async fn stream_anthropic_events(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+        sink: &dyn EventSink,
+    ) -> Result<LlmResponse> {
+        let url = format!("{}/v1/messages", self.base_url);
+
+        let api_messages = build_anthropic_messages(messages);
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "system": system,
+            "messages": api_messages,
+            "stream": true,
+        });
+
+        if !tools.is_empty() {
+            let tools_json: Vec<Value> = tools
+                .iter()
+                .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.input_schema}))
+                .collect();
+            body["tools"] = json!(tools_json);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&err_text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| if err_text.is_empty() { "Unknown API error".into() } else { err_text.chars().take(500).collect() });
+            return Err(AgentError::Provider(format!("Anthropic API error ({status}): {msg}")));
+        }
+
+        let mut content_blocks: Vec<ContentBlock> = Vec::new();
+        let mut current_text = String::new();
+        let mut current_tool_id = String::new();
+        let mut current_tool_name = String::new();
+        let mut current_tool_input = String::new();
+        let mut usage = None;
+        let mut in_tool = false;
+
+        let mut stream = resp.bytes_stream().eventsource();
+
+        while let Some(event) = stream.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if event.data == "[DONE]" {
+                break;
+            }
+
+            let data: Value = match serde_json::from_str(&event.data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match event.event.as_str() {
+                "content_block_start" => {
+                    let block = &data["content_block"];
+                    match block["type"].as_str() {
+                        Some("text") => {
+                            in_tool = false;
+                        }
+                        Some("tool_use") => {
+                            if !current_text.is_empty() {
+                                content_blocks.push(ContentBlock::Text { text: current_text.clone() });
+                                current_text.clear();
+                            }
+                            in_tool = true;
+                            current_tool_id = block["id"].as_str().unwrap_or_default().to_string();
+                            current_tool_name = block["name"].as_str().unwrap_or_default().to_string();
+                            current_tool_input.clear();
+                        }
+                        _ => {}
+                    }
+                }
+                "content_block_delta" => {
+                    let delta = &data["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta["text"].as_str() {
+                                current_text.push_str(text);
+                                if !in_tool {
+                                    sink.emit(AgentEvent::TextDelta { text: text.to_string() });
+                                }
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(partial) = delta["partial_json"].as_str() {
+                                current_tool_input.push_str(partial);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "content_block_stop" => {
+                    if in_tool {
+                        let input: Value = serde_json::from_str(&current_tool_input).unwrap_or(json!({}));
+                        content_blocks.push(ContentBlock::ToolUse {
+                            id: current_tool_id.clone(),
+                            name: current_tool_name.clone(),
+                            input,
+                        });
+                        in_tool = false;
+                    }
+                }
+                "message_delta" => {
+                    if let Some(u) = Usage::from_json(&data["usage"], "input_tokens", "output_tokens") {
+                        usage = Some(u);
+                    }
+                }
+                "message_start" => {
+                    if let Some(u) = Usage::from_json(&data["message"]["usage"], "input_tokens", "output_tokens") {
+                        usage = Some(u);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !current_text.is_empty() {
+            content_blocks.push(ContentBlock::Text { text: current_text });
+        }
+
+        Ok(LlmResponse { content: content_blocks, usage })
+    }
+
+    async fn stream_openai_events(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+        sink: &dyn EventSink,
+    ) -> Result<LlmResponse> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        let api_messages = build_openai_messages(messages, system);
+        let tools_json: Vec<Value> = tools
+            .iter()
+            .map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}}))
+            .collect();
+
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": api_messages,
+            "stream": true,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = json!(tools_json);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&err_text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| if err_text.is_empty() { "Unknown API error".into() } else { err_text.chars().take(500).collect() });
+            return Err(AgentError::Provider(format!("OpenAI API error ({status}): {msg}")));
+        }
+
+        let mut text = String::new();
+        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+        let mut usage = None;
+
+        let mut stream = resp.bytes_stream().eventsource();
+
+        while let Some(event) = stream.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if event.data == "[DONE]" {
+                break;
+            }
+
+            let data: Value = match serde_json::from_str(&event.data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(choices) = data["choices"].as_array() {
+                if let Some(choice) = choices.first() {
+                    let delta = &choice["delta"];
+
+                    if let Some(content) = delta["content"].as_str() {
+                        text.push_str(content);
+                        sink.emit(AgentEvent::TextDelta { text: content.to_string() });
+                    }
+
+                    if let Some(tcs) = delta["tool_calls"].as_array() {
+                        for tc in tcs {
+                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                            while tool_calls.len() <= index {
+                                tool_calls.push((String::new(), String::new(), String::new()));
+                            }
+                            if let Some(id) = tc["id"].as_str() {
+                                tool_calls[index].0 = id.to_string();
+                            }
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                tool_calls[index].1 = name.to_string();
+                            }
+                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                tool_calls[index].2.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(u) = Usage::from_json(&data["usage"], "prompt_tokens", "completion_tokens") {
+                usage = Some(u);
+            }
+        }
+
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+        for (id, name, args) in tool_calls {
+            if !name.is_empty() {
+                let input: Value = serde_json::from_str(&args).unwrap_or(json!({}));
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
         }

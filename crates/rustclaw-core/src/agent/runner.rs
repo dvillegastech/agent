@@ -4,6 +4,7 @@ use futures::future::join_all;
 use crate::config::AgentConfig;
 use crate::cost::CostTracker;
 use crate::error::Result;
+use crate::events::{AgentEvent, EventSink};
 use crate::export;
 use crate::retry;
 use crate::streaming::StreamingClient;
@@ -157,6 +158,128 @@ impl AgentRunner {
 
             self.conversation
                 .add_tool_results(MessageContent::Blocks(tool_results));
+        }
+
+        Ok("[Agent stopped after max iterations]".into())
+    }
+
+    /// Process a user message with event streaming for UI consumption.
+    pub async fn process_message_with_events(
+        &mut self,
+        user_input: &str,
+        sink: &dyn EventSink,
+    ) -> Result<String> {
+        self.conversation.add_user_message(user_input);
+
+        let mut iterations = 0;
+
+        loop {
+            iterations += 1;
+            if iterations > self.max_tool_iterations {
+                sink.emit(AgentEvent::Error {
+                    message: "Maximum tool iterations reached".into(),
+                });
+                break;
+            }
+
+            let messages = self.conversation.messages().to_vec();
+            let tools = self.tools.clone();
+            let system = self.system_prompt.clone();
+            let client = &self.streaming_client;
+
+            let response = retry::with_retry("LLM request", || {
+                let msgs = messages.clone();
+                let t = tools.clone();
+                let s = system.clone();
+                async move { client.stream_chat_with_events(&msgs, &t, &s, sink).await }
+            })
+            .await?;
+
+            // Track token usage
+            if let Some(ref usage) = response.usage {
+                self.cost_tracker
+                    .record(usage.input_tokens, usage.output_tokens);
+                sink.emit(AgentEvent::Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    total_input: self.cost_tracker.total_input_tokens,
+                    total_output: self.cost_tracker.total_output_tokens,
+                    estimated_cost: self.cost_tracker.estimated_cost(),
+                });
+            }
+
+            let (text, tool_calls) = response.decompose();
+
+            if tool_calls.is_empty() {
+                self.conversation
+                    .add_assistant_message(MessageContent::Blocks(response.content));
+                let final_text = if text.is_empty() {
+                    "[No response from model]".into()
+                } else {
+                    text
+                };
+                sink.emit(AgentEvent::Done {
+                    text: final_text.clone(),
+                });
+                return Ok(final_text);
+            }
+
+            // Collect tool info and emit events
+            let tool_infos: Vec<_> = tool_calls
+                .iter()
+                .filter_map(|block| {
+                    if let ContentBlock::ToolUse { id, name, input } = *block {
+                        sink.emit(AgentEvent::ToolStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: utils::truncate_oneline(&input.to_string(), 200),
+                        });
+                        Some((id.clone(), name.clone(), input.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            self.conversation
+                .add_assistant_message(MessageContent::Blocks(response.content));
+
+            // Execute tools
+            let executor = &self.executor;
+            let tool_futures: Vec<_> = tool_infos
+                .into_iter()
+                .map(|(id, name, input)| {
+                    let executor = &executor;
+                    async move {
+                        let result = executor.execute(&name, &input).await;
+                        let (content, is_error) = match result {
+                            Ok(output) => (output, false),
+                            Err(e) => (e.to_string(), true),
+                        };
+                        (id, name, content, is_error)
+                    }
+                })
+                .collect();
+
+            let results = join_all(tool_futures).await;
+
+            let mut tool_result_blocks = Vec::new();
+            for (id, name, content, is_error) in results {
+                sink.emit(AgentEvent::ToolResult {
+                    id: id.clone(),
+                    name,
+                    output: utils::truncate(&content, 500),
+                    is_error,
+                });
+                tool_result_blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content,
+                    is_error: if is_error { Some(true) } else { None },
+                });
+            }
+
+            self.conversation
+                .add_tool_results(MessageContent::Blocks(tool_result_blocks));
         }
 
         Ok("[Agent stopped after max iterations]".into())

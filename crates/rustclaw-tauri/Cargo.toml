@@ -31,5 +31,8 @@ dotenvy = "0.15"
 # Dirs for config paths
 dirs = "6"
 
+# Chrono for timestamps
+chrono = "0.4"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod cost;
 pub mod error;
+pub mod events;
 pub mod export;
 pub mod git;
 #[allow(dead_code)]

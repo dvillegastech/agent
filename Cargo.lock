@@ -3798,6 +3798,7 @@ name = "rustclaw-tauri"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "dotenvy",
  "rustclaw-core",
