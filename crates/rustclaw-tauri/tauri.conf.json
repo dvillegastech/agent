@@ -10,7 +10,6 @@
     "beforeBuildCommand": ""
   },
   "app": {
-    "title": "RustClaw Agent",
     "windows": [
       {
         "title": "RustClaw Agent",
