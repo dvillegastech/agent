@@ -13,7 +13,6 @@ use rustclaw_core::agent::runner::AgentRunner;
 use rustclaw_core::config::{AgentConfig, ProviderKind};
 use rustclaw_core::context;
 use rustclaw_core::events::{AgentEvent, EventSink};
-use rustclaw_core::rag;
 use rustclaw_core::session;
 
 // ─── Event Sink for Tauri ──────────────────────────────────────────
@@ -304,11 +303,8 @@ fn load_context_into(config: &mut AgentConfig) {
         config.system_prompt.push_str(&project_ctx);
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let index = rag::CodebaseIndex::build(&cwd);
-    if !index.entries.is_empty() {
-        config.system_prompt.push_str(&index.summary());
-    }
+    // Skip RAG indexing in desktop app — cwd is typically / or $HOME,
+    // which would scan the entire filesystem and hang on startup.
 }
 
 async fn auto_save_session(state: &AppState) {
