@@ -250,7 +250,7 @@ async fn load_session(
         .as_ref()
         .ok_or("Agent not configured")?;
 
-    let mut runner = AgentRunner::from_config(config);
+    let runner = AgentRunner::from_config(config);
 
     // We need to replay the messages into the conversation
     // For now, just rebuild and set session ID
