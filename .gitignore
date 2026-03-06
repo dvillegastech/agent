@@ -4,3 +4,7 @@
 *.swo
 *~
 .DS_Store
+
+# Tauri
+crates/rustclaw-tauri/src-tauri/target
+crates/rustclaw-tauri/icons

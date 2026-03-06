@@ -1,0 +1,38 @@
+[package]
+name = "rustclaw-tauri"
+version = "0.2.0"
+edition = "2021"
+description = "Tauri desktop app for the RustClaw LLM agent"
+license = "MIT"
+
+[[bin]]
+name = "rustclaw-desktop"
+path = "src-tauri/src/main.rs"
+
+[dependencies]
+rustclaw-core = { path = "../rustclaw-core" }
+
+# Tauri
+tauri = { version = "2", features = [] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Environment variables
+dotenvy = "0.15"
+
+# Dirs for config paths
+dirs = "6"
+
+# Chrono for timestamps
+chrono = "0.4"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
