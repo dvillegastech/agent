@@ -4,7 +4,7 @@
   "version": "0.2.0",
   "identifier": "com.rustclaw.agent",
   "build": {
-    "frontendDist": "../dist",
+    "frontendDist": "./dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "",
     "beforeBuildCommand": ""
