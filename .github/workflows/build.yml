@@ -12,27 +12,14 @@ env:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-            name: rustclaw-macos-arm64
-          - target: x86_64-apple-darwin
-            os: macos-13
-            name: rustclaw-macos-intel
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: rustclaw-linux-amd64
-
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -41,47 +28,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
 
       - name: Check workspace
-        run: cargo check --target ${{ matrix.target }}
+        run: cargo check --target aarch64-apple-darwin
 
       - name: Run tests
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo test --target aarch64-apple-darwin
 
       - name: Install Tauri CLI
-        if: startsWith(matrix.os, 'macos')
         run: cargo install tauri-cli --version "^2"
 
       - name: Build Tauri desktop app
-        if: startsWith(matrix.os, 'macos')
-        run: cargo tauri build --target ${{ matrix.target }}
+        run: cargo tauri build --target aarch64-apple-darwin
         working-directory: crates/rustclaw-tauri
 
-      - name: Build CLI binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package artifacts
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/rustclaw dist/${{ matrix.name }} || true
-          chmod +x dist/${{ matrix.name }} || true
-
-      - name: Upload CLI binary
+      - name: Upload Tauri app
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: dist/${{ matrix.name }}
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: Upload macOS Tauri app
-        if: startsWith(matrix.os, 'macos')
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}-tauri
+          name: rustclaw-macos-arm64
           path: |
-            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            target/${{ matrix.target }}/release/bundle/macos/*.app
+            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            target/aarch64-apple-darwin/release/bundle/macos/*.app
+          retention-days: 30
           if-no-files-found: warn
